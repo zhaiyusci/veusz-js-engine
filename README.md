@@ -54,8 +54,15 @@ starts there — but it needs nothing else.
 3. Put features in `features/`. They are found and loaded automatically.
 4. Restart Veusz.
 
-On its own, with no features dropped in, this plugin adds **no** user-visible
-feature — no settings row, no checkbox. That is the intended behaviour.
+Use **Tools → JS Engine Features…** to enable or disable entire features for
+the next startup. The manager remains available even when all features are off.
+With no features enabled, there are no feature-specific settings rows.
+
+Shipped features: **[MathJax](features/mathjax/README.md)**,
+**[KaTeX](features/katex/README.md)**, and
+**[SMILES molecular structures](features/smiles/README.md)**. For SMILES, enter a
+molecule such as `CCO` in a label and enable its **Text → SMILES** checkbox.
+The structure is drawn as vectors; its atom labels use the label's font.
 
 ```
 veusz-js-engine/               this repository: the platform
@@ -77,6 +84,10 @@ veusz-js-engine/               this repository: the platform
       feature.js               its own -- it hands Veusz the MathML
       katex.min.js             and Veusz typesets it with its own widget
       LICENSE-KATEX.txt
+    smiles/                    2D molecular structures from SMILES
+      feature.js               settings, lazy loading and render protocol
+      headless.js              SVG adapter and host-shaped atom labels
+      smiles-drawer.js         pinned, unmodified SmilesDrawer bundle
   test/test_platform.py        the platform's test
 ```
 

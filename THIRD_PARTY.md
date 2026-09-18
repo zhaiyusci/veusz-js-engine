@@ -2,8 +2,8 @@
 
 This project is distributed under the **Apache License 2.0** (see `LICENSE`).
 
-The layout is deliberately **one licence per artefact**, so nothing here needs a
-compatibility argument:
+First-party source is Apache-2.0. Third-party bundles retain their upstream
+licences and notices, including the licences of any bundled dependencies:
 
 | Artefact | What it is | Licence |
 |---|---|---|
@@ -12,6 +12,8 @@ compatibility argument:
 | `features/mathjax/mathjax.js` | MathJax 4.1.3 + font packages, bundled by esbuild | **Apache-2.0** — text in `licenses/mathjax-Apache-2.0.txt` |
 | `features/mathjax/fonts/*.js` | one font's data per file, read only when that font is chosen | **Apache-2.0** for the official MathJax fonts; **OFL-1.1** / **GUST** for the fonts converted here (see `licenses/`) |
 | `features/katex/katex.min.js` | KaTeX 0.18.7, unmodified | **MIT** — text in `features/katex/LICENSE-KATEX.txt` |
+| `features/smiles/smiles-drawer.js` | SmilesDrawer 2.4.1, unmodified npm bundle; includes chroma-js 2.4.2 | **MIT**, **BSD-3-Clause**, and **Apache-2.0** ColorBrewer data; notices in `features/smiles/LICENSE-*.txt` and the bundle |
+| `features/smiles/headless.js`, `features/smiles/feature.js` | SMILES adapter and feature | **Apache-2.0** (this project) |
 | `features/*/feature.js` | a feature, written against this platform | whatever its author says |
 | esbuild | build tool | MIT, used to build the MathJax bundle; not redistributed |
 
@@ -22,11 +24,11 @@ binary is recorded in the release notes.
 
 ## Are these licences compatible?
 
-They do not even have to be compatible, because no two licences meet inside a
-single file:
+The bundled permissive components can be redistributed together while retaining
+their respective notices:
 
-* **MIT** (QuickJS, KaTeX) is lax and non-copyleft; it is compatible with
-  everything here.
+* **MIT** (QuickJS, KaTeX, SmilesDrawer) and **BSD-3-Clause** (chroma-js) are
+  permissive, non-copyleft licences. Keep the original notices and disclaimers.
 * **Apache-2.0** (this project, MathJax) is lax and non-copyleft too. It is
   *not* a copyleft licence: it does not require derivative works to be licensed
   the same way. Its extra conditions compared with MIT are paperwork plus a
@@ -48,7 +50,7 @@ single file:
 
 1. `LICENSE` — Apache-2.0 (this project).
 2. `NOTICE` — attribution for MathJax, mhchemParser, the converted fonts,
-   KaTeX and QuickJS.
+   KaTeX, SmilesDrawer, chroma-js/ColorBrewer and QuickJS.
 3. `THIRD_PARTY.md` — this file.
 4. `licenses/` — the notices above, so `features/` is self-describing if it is
    separated from the rest.

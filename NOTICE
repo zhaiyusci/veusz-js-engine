@@ -39,6 +39,20 @@ KaTeX 0.18.7
     Shipped unmodified as features/katex/katex.min.js, and used to parse LaTeX
     into MathML, which Veusz's own MathML widget then typesets.
 
+SmilesDrawer 2.4.1
+    Copyright (c) 2017 GDB / Reymond Research Group
+    Licensed under the MIT License (see features/smiles/LICENSE-SMILESDRAWER.txt)
+    Unmodified npm browser bundle shipped as features/smiles/smiles-drawer.js.
+    A separate adapter supplies headless SVG generation and Qt text outlines.
+    https://github.com/reymond-group/smilesDrawer
+
+chroma-js 2.4.2 (included in the SmilesDrawer bundle)
+    Copyright (c) 2011-2019 Gregor Aisch
+    Licensed under BSD-3-Clause (see features/smiles/LICENSE-CHROMA.txt).
+    Includes ColorBrewer colors, Copyright (c) 2002 Cynthia Brewer,
+    Mark Harrower, and The Pennsylvania State University, under Apache-2.0.
+    Original bundled notices are retained in smiles-drawer.js.
+
 QuickJS (quickjs-ng 0.16.2)
     Copyright (c) 2017-2026 Fabrice Bellard
     Copyright (c) 2017-2024 Charlie Gordon

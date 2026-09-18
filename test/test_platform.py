@@ -1230,10 +1230,20 @@ class JsFeatureTests(unittest.TestCase):
         panel.layout.activate()
         row.layout().activate()
         menu = row.controls[1]
-        self.assertGreater(menu.width(), menu.sizeHint().width() * 3,
-                           'the font menu kept its minimum width')
-        self.assertGreater(menu.width(), row.controls[2].width(),
-                           'the font menu is narrower than a checkbox')
+        initial_width = menu.width()
+        checkbox_width = row.controls[2].width()
+        # Other features can add wider setting labels. Test the actual stretch
+        # behavior rather than a fixed ratio tied to the installed feature set.
+        panel.resize(620, 700)
+        # Hidden widgets do not receive resize events until shown; explicitly
+        # give the layout the new rectangle so this also works headlessly.
+        panel.layout.setGeometry(panel.rect())
+        row.layout().setGeometry(row.rect())
+        self.assertGreaterEqual(menu.width() - initial_width, 150,
+                                'the font menu did not absorb extra row width')
+        self.assertEqual(row.controls[2].width(), checkbox_width,
+                         'the checkbox stretched instead of the font menu')
+        self.assertGreater(menu.width(), menu.sizeHint().width())
 
     def test_a_font_file_that_will_not_load_says_so(self):
         """A stale font file must not take the frame down, or draw in the
