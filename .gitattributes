@@ -1,0 +1,23 @@
+# Line endings: normalise on commit, native endings on checkout.
+* text=auto
+
+# The batch files are CRLF-only as far as cmd.exe is concerned: with LF-only
+# endings cmd mis-parses blocks and can drop the last line.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binaries, and the JavaScript that is generated or third-party: never diffed,
+# never normalised.  One line each, so it is visible what is not ours.
+*.dll binary
+*.so binary
+*.dylib binary
+features/mathjax/mathjax.js binary
+features/mathjax/fonts/*.js binary
+features/katex/katex.min.js binary
+
+# Everything else we wrote is text and should diff.  Deliberately not `*.js`:
+# this repository exists to make features easy to write, `jsapi.js` is the API
+# they are written against, and a change to one of them has to be readable in
+# git log -p.
+jsapi.js text diff merge
+features/*/feature.js text diff merge

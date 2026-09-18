@@ -1,0 +1,11 @@
+# Runtime state: written next to the plugin when Veusz loads it, so a user can
+# find it, and never part of the source.
+*.log
+__pycache__/
+*.pyc
+
+# Test output: the suites write their PNGs into build-test* directories
+build-test*/
+
+# Scratch: probes, exports, notes -- the measurements that led here
+build/
