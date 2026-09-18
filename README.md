@@ -58,8 +58,7 @@ On its own, with no features dropped in, this plugin adds **no** user-visible
 feature — no settings row, no checkbox. That is the intended behaviour.
 
 ```
-veusz-js-engine/  <- this repository: the platform, and the one
-                      plugin Veusz is told about
+veusz-js-engine/               this repository: the platform
   veusz_js_engine.py           the one plugin Veusz is told about
   qjs.dll                      the engine: QuickJS (MIT) — the platform's
   jsapi.js                     the API a feature is written against
