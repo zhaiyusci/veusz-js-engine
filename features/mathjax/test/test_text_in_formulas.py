@@ -89,6 +89,13 @@ def draw(text, font='tex', display=False, size=20.0, label=None, passes=3):
                'face': platform_module.text_font_key(qt, label)}
     reply = json.loads(js_feature.runtime.call('veuszRender',
                                                json.dumps(request)))
+    for _ in range(33):
+        if 'load' not in reply:
+            break
+        platform_module.load_feature_file(js_feature, reply['load'])
+        reply = json.loads(js_feature.runtime.call('veuszRender', json.dumps(request)))
+    else:
+        raise AssertionError('the feature kept asking for deferred files')
     asked = []
     for _ in range(passes):
         if 'measure' not in reply:

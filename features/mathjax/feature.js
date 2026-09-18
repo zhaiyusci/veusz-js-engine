@@ -1,11 +1,9 @@
+// VEUSZ-DEFER ["mathjax.js"]
 /* MathJax formulas for Veusz: the whole feature, in JavaScript.
  *
- * The platform puts the `veusz` API in this runtime, hands over the head of
- * every file this feature carries (JavaScript cannot read a file), and then
- * loads this directory's files in name order, ending with this one -- so the
- * MathJax bundle (mathjax.js) is already here by the time the code below runs.
- * The files in `fonts/` are *not*: one font's data is megabytes, so only the
- * font that is actually used is read (see the `load` reply below).
+ * Startup registers settings using file-head declarations only. The bundle
+ * and font data are evaluated on demand on the first enabled, nonempty render
+ * (see the `load` replies below).
  *
  * Nothing in here knows about Veusz or Qt.  It declares one switch, one font
  * chooser and one style box, and it answers the platform's request to draw with
@@ -370,6 +368,9 @@
         var text = String(req.text == null ? '' : req.text);
         if (!text) {
             return null;
+        }
+        if (!globalThis.__veuszMathjax && !globalThis.fontNames) {
+            return JSON.stringify({load: 'mathjax.js'});
         }
         var fontId = fontOf(req.get('font'));
         var sizePt = req.size > 0 ? req.size : 20;

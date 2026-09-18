@@ -65,8 +65,14 @@ def ask(text, display=False, size=20.0, on=True):
     request = {'text': text, 'size': size, 'color': None,
                'props': {'on': on, 'display': display},
                'face': ''}
-    reply = js_feature.runtime.call('veuszRender', json.dumps(request))
-    return json.loads(reply) if reply.strip() else ''
+    import veusz_js_engine as platform_module
+    for _ in range(33):
+        raw = js_feature.runtime.call('veuszRender', json.dumps(request))
+        reply = json.loads(raw) if raw.strip() else ''
+        if not isinstance(reply, dict) or 'load' not in reply:
+            return reply
+        platform_module.load_feature_file(js_feature, reply['load'])
+    raise AssertionError('the feature kept asking for deferred files')
 
 
 class NativeMathMLMixin(object):

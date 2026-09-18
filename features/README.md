@@ -19,16 +19,40 @@ features/
 ```
 
 Everything in a feature's directory belongs to that feature, including its
-README and its tests. Nothing there is loaded by Veusz, and only the entry
-point (`feature.js`, or `feature.py` for a feature that has to reach into
-Veusz) is executed by the platform.
+README and its tests. Veusz itself loads only the platform. The platform
+executes the entry point (`feature.js`, or `feature.py` for a feature that has
+to reach into Veusz) and its JavaScript dependencies as described below.
+
+## Enable or disable features
+
+Open **Tools -> JS Engine Features...** in Veusz. Check the features you want,
+click **Save**, then close all Veusz windows and restart. The list shows the
+current session status separately from the choices for the next startup.
+Cancel leaves preferences unchanged.
+
+All features are enabled by default. Disabled features are still listed, but
+their JavaScript/Python entry points are not executed, no runtime is created,
+and no settings or render hooks are registered. The manager remains available
+even if every feature is disabled. Saving never changes the current session,
+even if the platform plugin is loaded again before restarting.
+
+Choices are global user preferences stored in Veusz's settings database as
+`js_engine_disabled_features`, keyed by discovery name (directory name or
+single-file stem). No plugin files need to be modified. Temporarily missing
+features retain their choices; new feature names default to enabled. Discovery
+does not execute feature code to obtain titles.
+
+**Before opening a document that uses a disabled feature, re-enable it and
+restart.** Its settings are unavailable while disabled, so that document may
+not load correctly. This global control is separate from a feature's per-label
+switch, such as the MathJax checkbox.
 
 ## A feature is a directory
 
 One directory per feature, with the entry point named **`feature.js`**.
-Everything else in the directory belongs to the feature and is **not**
-executed: its JavaScript, data files, helpers, a README. The feature finds them
-through `__file__`:
+Everything else in the directory belongs to the feature; its JavaScript is
+loaded by the rules below, not discovered as separate features. Python features
+can find their data files through `__file__`:
 
 ```python
 from pathlib import Path
@@ -47,7 +71,25 @@ every other `*.js` in the directory runs before it in name order. That is how a
 bundle and a thin wrapper need no manifest to say which is which, and it keeps
 the platform's rule that order comes from the name.
 
-`fonts/` is the one exception, and deliberately so: a font's data can be
+A feature can opt into **lazy bundles** with a first-line declaration in
+`feature.js` (JSON, sibling `.js` filenames only):
+
+```javascript
+// VEUSZ-DEFER ["mathjax.js"]
+```
+
+Those files are skipped at startup. Register settings without using the bundle;
+when an enabled, nonempty render needs it, return
+`JSON.stringify({load: "mathjax.js"})`. The host evaluates it once and retries
+the render. A subsequent font load is supported in the same render; repeated
+requests or more than 32 loads fail visibly rather than looping. Only declared
+bundles and files under `fonts/` may be requested, not arbitrary disk paths.
+MathJax and KaTeX use this: unused engines are never parsed/evaluated, while
+settings and the font chooser are available immediately. The first formula pays
+the bundle initialization cost; later formulas reuse it. Features without the
+header keep their existing eager loading order.
+
+`fonts/` is also deferred, deliberately so: a font's data can be
 megabytes and a feature may offer a dozen, so those files are **not** run at
 startup. They are read when the feature asks for one, by replying
 `{load: "fonts/x.js"}` to a render request. JavaScript cannot read a file, so
@@ -58,8 +100,8 @@ and description out of that head (its own convention; ours is a
 `// MATHJAX-FONT {…}` line), offers it, and pays for its data only when the
 user picks it.
 
-There is no header, no `package.json` and no directory to register. The names in
-a feature's directory are the whole configuration.
+There is no required header, no `package.json` and no directory to register.
+Only lazy bundles need the optional declaration above.
 
 ## The engine is the platform's
 

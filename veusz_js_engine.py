@@ -790,6 +790,8 @@ class Platform(object):
         self.quickjs = find_quickjs(self.here)
         self._runtimes = {}
         self._features = []
+        # Frozen on first feature discovery: preference edits need a restart.
+        self.disabled_features = None
         self.log = []
         self.state = state if state is not None else State()
 
@@ -850,7 +852,8 @@ class Platform(object):
         The order is: the platform's API, then every other ``*.js`` of the
         feature in name order, then its entry point -- so ``feature.js`` may
         lean on a bundle beside it and on ``veusz`` without either being a
-        special case.
+        special case. Bundles opted into VEUSZ-DEFER are skipped until a
+        render requests them; settings must not depend on their globals.
 
         Keyed by the **entry point**, not by the API file: every feature shares
         one ``jsapi.js``, and keying by it would run them all in a single
@@ -869,6 +872,7 @@ class Platform(object):
                               engine=quickjs, label=entry)
             runtime.feature_entry = entry
             runtime.loaded_scripts = set()
+            runtime.deferred_bundles = _deferred_bundles(entry, feature_dir)
             self._runtimes[key] = runtime
 
         api = self.js_api()
@@ -2181,6 +2185,32 @@ def _feature_entries(directory):
     return entries
 
 
+def _deferred_bundles(entry, feature_dir):
+    """Opt-in list in the entry's first line; legacy features stay eager."""
+    if feature_dir is None:
+        return set()
+    with Path(entry).open(encoding='utf-8') as stream:
+        header = stream.readline(4096).strip()
+    marker = '// VEUSZ-DEFER '
+    if not header.startswith(marker):
+        return set()
+    try:
+        names = json.loads(header[len(marker):])
+    except ValueError as exc:
+        raise JsEngineError('invalid VEUSZ-DEFER declaration: %s' % exc)
+    if not isinstance(names, list) or any(
+            not isinstance(name, str) or not name.endswith('.js')
+            or '/' in name or '\\' in name or ':' in name
+            or name in (Path(entry).name, JS_API_FILE) for name in names):
+        raise JsEngineError('VEUSZ-DEFER must list sibling JavaScript bundles')
+    directory = Path(feature_dir).resolve()
+    paths = {(directory / name).resolve() for name in names}
+    forbidden = {Path(entry).resolve(), (directory / JS_API_FILE).resolve()}
+    if any(path.parent != directory or path in forbidden for path in paths):
+        raise JsEngineError('deferred bundle must be a sibling, not the entry/API')
+    return paths
+
+
 def _js_load_order(entry, feature_dir):
     """The JavaScript files of a feature, in the order they must run.
 
@@ -2190,13 +2220,16 @@ def _js_load_order(entry, feature_dir):
     the platform's rule that order comes from the name and is decided without
     running anything.
 
-    A one-file feature is just its own file.
+    Bundles named in the entry's VEUSZ-DEFER header are excluded. A one-file
+    feature is just its own file.
     """
     entry = Path(entry)
     if feature_dir is None:
         return [entry]
     directory = Path(feature_dir)
-    others = sorted(p for p in directory.glob('*.js') if p.name != entry.name)
+    deferred = _deferred_bundles(entry, feature_dir)
+    others = sorted(p for p in directory.glob('*.js')
+                    if p.name != entry.name and p.resolve() not in deferred)
     # fonts/*.js is deliberately absent: a font's data is large and a feature
     # may carry many, so it is read when something asks for that font, not on
     # the chance that it will be
@@ -2514,10 +2547,9 @@ def load_feature_file(feature, name):
     for the one it needs and gets it here.
 
     The name comes from JavaScript, so it is checked rather than trusted, and
-    the check is narrow: a ``.js`` file under the feature's own ``fonts/``.
-    Nothing else is ever deferred, so nothing else may be asked for -- which
-    also keeps a feature from reading the disk, or from re-running its own
-    entry point by naming it.
+    the check is narrow: a ``.js`` file under the feature's own ``fonts/``
+    or a sibling bundle explicitly listed by its VEUSZ-DEFER header. This
+    keeps a feature from reading arbitrary files or re-running its entry.
     """
     directory = feature.feature_dir
     if directory is None:
@@ -2529,10 +2561,12 @@ def load_feature_file(feature, name):
     try:
         candidate.relative_to(fonts)
     except ValueError:
-        raise JsEngineError('%s asked for a file outside its fonts/: %r'
-                            % (feature.name, name))
+        if (candidate.parent != directory or candidate not in
+                getattr(feature.runtime, 'deferred_bundles', set())):
+            raise JsEngineError('%s asked for a file outside its fonts/ '
+                                'or declared bundles: %r' % (feature.name, name))
     if candidate.suffix.lower() != '.js' or not candidate.is_file():
-        raise JsEngineError('%s asked for a font file it does not have: %r'
+        raise JsEngineError('%s asked for a JavaScript file it does not have: %r'
                             % (feature.name, name))
     if candidate in feature.runtime.loaded_scripts:
         return
@@ -2619,17 +2653,22 @@ def install_js_feature(platform, entry, feature_dir, name):
                                              face=face))
         if reply is None:
             return None
-        if 'load' in reply:
-            # the feature wants the data for a font it offers; it is read once
-            # and then the question is asked again, because the answer may
-            # differ now that the font is registered
+        requested_files = set()
+        while 'load' in reply:
+            # A cold render may need a bundle followed by a font. Never spin
+            # on a broken feature that keeps requesting the same file.
             try:
-                load_feature_file(feature, reply['load'])
+                requested = str(reply['load'])
+                canonical = (Path(feature.feature_dir or feature.entry.parent)
+                             / requested).resolve()
+                if canonical in requested_files or len(requested_files) >= 32:
+                    raise JsEngineError('repeated or excessive deferred load')
+                requested_files.add(canonical)
+                load_feature_file(feature, requested)
             except (JsEngineError, OSError) as exc:
-                # A font file that will not load must not take the frame down
-                # with it, and the formula must not be drawn in the wrong font
-                # either: say why, on the drawing and in the report.  This is
-                # what a file built for another bundle looks like.
+                # A failed bundle/font or broken load protocol must not take
+                # the frame down or silently draw with the wrong engine/font.
+                # Say why on the drawing and in the report.
                 message = '%s could not be read: %s' % (reply['load'], exc)
                 platform.state.note('%s: %s' % (feature.name, message))
                 return renderer_class(painter, font, x, y, text,
@@ -2678,6 +2717,154 @@ def install_js_feature(platform, entry, feature_dir, name):
     return feature
 
 
+FEATURE_DISABLED_KEY = 'js_engine_disabled_features'
+
+
+def disabled_feature_preferences(database=None):
+    """Read next-start preferences without loading any feature code."""
+    if database is None:
+        try:
+            from veusz.setting import settingdb
+        except ImportError:              # standalone engine use needs no Qt
+            return set()
+        database = settingdb
+    value = database.get(FEATURE_DISABLED_KEY, [])
+    if not isinstance(value, (list, tuple)):
+        return set()
+    return {name for name in value if isinstance(name, str)}
+
+
+def discover_features(here):
+    """Inventory by discovery name, not JS declarations (disabled code is inert)."""
+    found = {}
+    for directory in find_feature_dirs(here):
+        if directory.is_dir():
+            for name, entry, _directory in _feature_entries(directory):
+                found.setdefault(name, entry)
+    return sorted(found.items())
+
+
+def save_feature_preferences(choices, database=None):
+    """Persist choices, retaining preferences for temporarily absent features."""
+    if database is None:
+        from veusz.setting import settingdb
+        database = settingdb
+    disabled = disabled_feature_preferences(database)
+    for name, enabled in choices.items():
+        if enabled:
+            disabled.discard(name)
+        else:
+            disabled.add(name)
+    previous = database.get(FEATURE_DISABLED_KEY, [])
+    database[FEATURE_DISABLED_KEY] = sorted(disabled)
+    try:
+        database.writeSettings()
+    except Exception:
+        database[FEATURE_DISABLED_KEY] = previous
+        raise
+
+
+def feature_manager_dialog(platform, parent=None):
+    """Build a small restart-only control panel; opening it evaluates no JS."""
+    import veusz.qtall as qt
+
+    dialog = qt.QDialog(parent)
+    dialog.setWindowTitle('JS Engine Features')
+    dialog.resize(640, 350)
+    layout = qt.QVBoxLayout(dialog)
+    text = qt.QLabel(
+        'Choose which features to enable at the next Veusz startup.\n'
+        'Changes require restarting all Veusz windows.\n'
+        'Disabled features do not register settings or render content.\n'
+        'Documents using their settings may not load correctly while disabled.',
+        dialog)
+    text.setWordWrap(True)
+    layout.addWidget(text)
+    tree = qt.QTreeWidget(dialog)
+    tree.setObjectName('jsEngineFeatureList')
+    tree.setHeaderLabels(['Enabled next startup', 'Current session', 'Location'])
+    disabled = disabled_feature_preferences()
+    entries = discover_features(platform.here)
+    for name, entry in entries:
+        if name in platform.state.feature_names:
+            status = 'Loaded'
+        elif name in (platform.disabled_features or set()):
+            status = 'Disabled'
+        else:
+            status = 'Not loaded'
+        item = qt.QTreeWidgetItem(tree, [name, status, str(entry)])
+        item.setFlags(item.flags() | qt.Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(0, qt.Qt.CheckState.Unchecked if name in disabled
+                           else qt.Qt.CheckState.Checked)
+        item.setToolTip(0, str(entry))
+        item.setToolTip(2, str(entry))
+    tree.resizeColumnToContents(0)
+    tree.resizeColumnToContents(1)
+    layout.addWidget(tree)
+    if not entries:
+        layout.addWidget(qt.QLabel('No features found.', dialog))
+    buttons = qt.QDialogButtonBox(
+        qt.QDialogButtonBox.StandardButton.Save
+        | qt.QDialogButtonBox.StandardButton.Cancel, parent=dialog)
+    layout.addWidget(buttons)
+
+    def save():
+        choices = {tree.topLevelItem(i).text(0):
+                   tree.topLevelItem(i).checkState(0) == qt.Qt.CheckState.Checked
+                   for i in range(tree.topLevelItemCount())}
+        try:
+            save_feature_preferences(choices)
+        except Exception as exc:
+            qt.QMessageBox.warning(dialog, 'Could not save features', str(exc))
+            return
+        dialog.accept()
+
+    buttons.accepted.connect(save)
+    buttons.rejected.connect(dialog.reject)
+    return dialog
+
+
+def install_feature_manager(platform):
+    """One Tools action on existing and future main windows, across re-exec."""
+    import veusz.qtall as qt
+    import veusz.utils as utils
+    from veusz.windows.mainwindow import MainWindow
+
+    def add_action(window):
+        menu = getattr(window, 'menus', {}).get('tools')
+        if menu is None:
+            return
+        if any(action.objectName() == 'jsEngineFeatures'
+               for action in menu.actions()):
+            return
+        action = menu.addAction('JS Engine Features...')
+        action.setObjectName('jsEngineFeatures')
+
+        def show(_checked=False):
+            current = getattr(utils, PUBLISH_ATTR, platform)
+            dialog = feature_manager_dialog(current, window)
+            dialog.exec()
+            dialog.deleteLater()
+
+        action.triggered.connect(show)
+
+    if not getattr(MainWindow, '_js_engine_feature_menu_hooked', False):
+        original = MainWindow._defineMenus
+
+        def define_menus(window, *args, **kwargs):
+            result = original(window, *args, **kwargs)
+            add_action(window)
+            return result
+
+        MainWindow._defineMenus = define_menus
+        MainWindow._js_engine_feature_menu_hooked = True
+    app = qt.QApplication.instance()
+    if app is not None:
+        for window in app.topLevelWidgets():
+            if isinstance(window, MainWindow):
+                add_action(window)
+
+
 def load_features(platform, here=None):
     """Load the features found in the feature directories.
 
@@ -2700,11 +2887,15 @@ def load_features(platform, here=None):
     the rest are still loaded.
     """
     state = platform.state
+    if platform.disabled_features is None:
+        platform.disabled_features = disabled_feature_preferences()
     loaded, failed = [], []
     for directory in find_feature_dirs(here if here is not None else platform.here):
         if not directory.is_dir():
             continue
         for name, plugin, feature_dir in _feature_entries(directory):
+            if name in platform.disabled_features:
+                continue
             if name in state.feature_names:
                 # This feature is already up, or a second directory offered one
                 # of the same name.  Skipping avoids paying the JavaScript
@@ -2796,6 +2987,10 @@ def install(verbose=True):
     # exist first.  They find the platform on veusz.utils, which was set just
     # above.  Loading is idempotent, so a second install is harmless.
     loaded, failed = load_features(platform, here)
+    try:
+        install_feature_manager(platform)
+    except Exception as exc:
+        state.note('feature manager UI unavailable: %s' % exc)
 
     if verbose:
         _say('veusz-js-engine %s: platform%s, %d feature(s)'
@@ -2822,6 +3017,8 @@ def _write_log(here, platform, state):
                  'engine: %s' % (platform.quickjs or '(not found)')]
         for path in state.features:
             lines.append('feature: %s  (%s)' % (feature_name(path), path))
+        for name in sorted(platform.disabled_features or set()):
+            lines.append('disabled feature: %s' % name)
         for note in state.notes:
             lines.append('note: %s' % note)
         (here / 'veusz_js_engine.log').write_text('\n'.join(lines) + '\n',

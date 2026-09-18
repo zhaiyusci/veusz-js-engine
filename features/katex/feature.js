@@ -1,3 +1,4 @@
+// VEUSZ-DEFER ["katex.min.js"]
 /* KaTeX for Veusz: the whole feature, in JavaScript.
  *
  * KaTeX parses the LaTeX and hands back MathML.  Veusz draws MathML itself --
@@ -119,7 +120,7 @@
         }
         if (typeof katex === 'undefined'
                 || typeof katex.renderToString !== 'function') {
-            return veusz.error('the KaTeX library did not load');
+            return JSON.stringify({load: 'katex.min.js'});
         }
         var display = !!req.get('display');
         var source = normalize(text);

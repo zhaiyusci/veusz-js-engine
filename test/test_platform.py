@@ -382,8 +382,7 @@ class VeuszTests(unittest.TestCase):
         request = {'text': text, 'size': size, 'color': color,
                    'props': {'on': True, 'font': font, 'display': display},
                    'face': platform_module.text_font_key(qt, self.label_font)}
-        reply = json.loads(features[0].runtime.call('veuszRender',
-                                                    json.dumps(request)))
+        reply = self.ask_loaded(features[0], request)
         for _ in range(3):
             if 'measure' not in reply:
                 return reply
@@ -394,8 +393,17 @@ class VeuszTests(unittest.TestCase):
                                                         json.dumps(request)))
         self.fail('the feature kept asking for measurements')
 
+    def ask_loaded(self, feature, request):
+        """Complete deferred file loads, but leave text measurement to the test."""
+        for _ in range(33):
+            reply = json.loads(feature.runtime.call('veuszRender', json.dumps(request)))
+            if 'load' not in reply:
+                return reply
+            platform_module.load_feature_file(feature, reply['load'])
+        self.fail('the feature kept asking for deferred files')
+
     def ask_raw(self, text, **kwargs):
-        """The first answer only -- to see whether it asked for anything."""
+        """First answer after loading -- inspect text measurement requests."""
         import json
         platform = getattr(veusz.utils, 'js_engine')
         features = [f for f in platform.feature_objects() if f.name == 'mathjax']
@@ -405,8 +413,7 @@ class VeuszTests(unittest.TestCase):
                    'face': platform_module.text_font_key(
                        qt, kwargs.get('label_font') or qt.QFont('DejaVu Sans',
                                                                 20))}
-        return json.loads(features[0].runtime.call('veuszRender',
-                                                   json.dumps(request)))
+        return self.ask_loaded(features[0], request)
 
     def test_the_javascript_mathjax_feature_reproduces_the_geometry(self):
         """The feature's own ex-to-points arithmetic, against the measured box.
