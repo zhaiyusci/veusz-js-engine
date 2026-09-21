@@ -4,6 +4,7 @@ Run: python features/smiles/test/test_smiles_feature.py
 Outputs use inherited-ACL build-test-smiles, never a private temporary folder.
 The parser examples test supported drawings, not chemical validation.
 """
+import copy
 import json
 import math
 import os
@@ -27,11 +28,31 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'windows' if sys.platform == 'win32' el
 
 import veusz
 import veusz.qtall as qt
-import veusz.document
-import veusz.setting
-import veusz.setting.collections
-import veusz.utils
-import veusz.windows.mainwindow
+
+class MemoryQSettings:
+    """Keep even upstream's import-time preference accesses in memory."""
+    def __init__(self, *args, **kwargs):
+        self.values = {}
+
+    def childKeys(self):
+        return list(self.values)
+
+    def value(self, key):
+        return self.values[key]
+
+    def setValue(self, key, value):
+        self.values[key] = value
+
+    def remove(self, key):
+        self.values.pop(key, None)
+
+
+with patch.object(qt, 'QSettings', MemoryQSettings):
+    import veusz.document
+    import veusz.setting
+    import veusz.setting.collections
+    import veusz.utils
+    import veusz.windows.mainwindow
 import veusz_js_engine as engine
 
 assert Path(veusz.__file__).resolve().is_relative_to(UPSTREAM.resolve())
@@ -64,19 +85,26 @@ def image_stats(image):
 class SmilesFeatureTests(unittest.TestCase):
     def setUp(self):
         self.platform = engine.Platform(PROJECT)
-        self.settings, self.hooks = {}, []
-        # Real JsFeature hook and runtime; only capture registration and return
-        # the reply rather than requiring a live page painter for unit tests.
-        with patch.object(self.platform, 'add_setting', side_effect=lambda target, group, setting: self.settings.update({setting.name: setting})), \
-             patch.object(self.platform, 'hook_draw', side_effect=lambda target, hook: self.hooks.append(hook)), \
-             patch.object(self.platform, '_svg_renderer_class', return_value=lambda *a, **kw: kw['reply']):
-            self.feature = engine.install_js_feature(self.platform, FEATURE / 'feature.js', FEATURE, 'smiles')
+        # A fresh native registration per test keeps deferred bundles/cache cold.
+        factory = veusz.document.thefactory
+        registry = patch.dict(factory.regwidgets)
+        registry.start()
+        self.addCleanup(registry.stop)
+        factory.regwidgets.pop('smiles', None)
+        self.feature = engine.install_js_feature(self.platform, FEATURE / 'feature.js', FEATURE, 'smiles')
         self.runtime = self.feature.runtime
         self.addCleanup(self.runtime.close)
+        self.doc = veusz.document.Document()
+        self.commands = veusz.document.CommandInterface(self.doc)
+        self.page = self.commands.Add('page')
+        self.commands.To(self.page)
+        self.commands.Add('smiles', name='molecule')
+        self.widget = self.doc.resolveWidgetPath(None, '/' + self.page + '/molecule')
+        self.settings = self.widget.settings
 
-    def request(self, text, size=20, scale=1, colored=True, on=True, face=None, **extra):
-        req = dict(text=text, size=size, color='#123456',
-                   props=dict(on=on, scale=scale, colored=colored),
+    def request(self, text, size=12, colored=True, face=None, **extra):
+        req = dict(text='NOT THE MOLECULE SOURCE', size=size, color='#123456',
+                   props=dict(smiles=text, colored=colored),
                    face=face or engine.text_font_key(qt, font()))
         req.update(extra)
         return req
@@ -124,39 +152,162 @@ class SmilesFeatureTests(unittest.TestCase):
         self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
         return root
 
-    def test_install_ui_and_off_empty_stay_cold(self):
-        self.assertEqual(set(self.settings), {'smiles', 'smilesColored', 'smilesScale'})
-        self.assertFalse(self.settings['smiles'].val)
-        self.assertTrue(self.settings['smilesColored'].val)
-        self.assertEqual(self.settings['smilesScale'].val, 1)
-        self.assertFalse(self.settings['smiles'].hidden)
-        self.assertTrue(self.settings['smilesColored'].hidden)
-        control = self.settings['smiles'].makeControl(None)
-        self.assertEqual(len(control.controls), 2)
+    def draw(self, pagesize=(500, 300), dpi=100):
+        helper = veusz.document.PaintHelper(self.doc, pagesize, dpi=(dpi, dpi))
+        self.widget.draw([0, 0, *pagesize], helper)
+        return helper
+
+    def painted(self, pagesize=(500, 300), dpi=100):
+        helper = self.draw(pagesize, dpi)
+        image = qt.QImage(*pagesize, qt.QImage.Format.Format_ARGB32)
+        image.fill(qt.Qt.GlobalColor.transparent)
+        painter = qt.QPainter(image)
+        helper.renderToPainter(painter)
+        painter.end()
+        return image, helper
+
+    def test_declaration_native_settings_and_empty_hidden_stay_cold(self):
+        declaration = json.loads(self.runtime.call('veuszDescribe', ''))
+        self.assertEqual(declaration['target'], 'widget')
+        self.assertEqual(declaration['source'], 'smiles')
+        self.assertEqual(declaration['version'], '0.3.0')
+        self.assertEqual(declaration['sizing'], 'font')
+        self.assertEqual(self.settings.size, '12pt')
+        self.assertEqual({p['name'] for p in declaration['properties']}, {'smiles', 'colored'})
+        self.assertEqual(self.settings.smiles, 'CCO')
+        self.assertTrue(self.settings.colored)
+        for name in ('smiles', 'colored', 'font', 'size', 'color', 'xPos', 'yPos', 'rotate', 'hide'):
+            self.assertIn(name, self.settings)
+        for name in ('Text', 'on', 'scale', 'width', 'height', 'smilesColored', 'smilesScale'):
+            self.assertNotIn(name, self.settings)
+        text = veusz.setting.collections.Text('Text')
+        for name in ('smiles', 'smilesColored', 'smilesScale'):
+            self.assertNotIn(name, text)
         self.assertEqual(self.runtime.run('typeof globalThis.smilesToSvg'), 'undefined')
         with patch.object(self.runtime, 'eval_file', wraps=self.runtime.eval_file) as evaluate:
-            for text, on in [('CCO', False), ('', True), (' \n\t ', True)]:
-                self.assertIsNone(self.call(self.request(text, on=on)))
+            for source in ('', ' \n\t '):
+                self.assertIsNone(self.call(self.request(source)))
+                self.settings.get('smiles').set(source)
+                self.draw()
+            self.settings.get('smiles').set('CCO')
+            self.settings.get('hide').set(True)
+            self.draw()
             evaluate.assert_not_called()
         self.assertFalse({Path(p).name for p in self.runtime.loaded_scripts} & {'headless.js', 'smiles-drawer.js'})
 
-    def test_real_hook_loads_once_and_shapes_with_qt(self):
-        self.settings['smiles'].val = True
-        image = qt.QImage(500, 300, qt.QImage.Format.Format_ARGB32)
-        painter = qt.QPainter(image)
-        try:
-            with patch.object(self.runtime, 'eval_file', wraps=self.runtime.eval_file) as evaluate, \
-                 patch.object(engine, 'measure_text_runs', wraps=engine.measure_text_runs) as measure:
-                result = self.hooks[0](painter, font(), 0, 0, 'CCO', self.settings)
-                self.valid_svg(result)
-                self.assertEqual([c.args[0].name for c in evaluate.call_args_list], ['headless.js', 'smiles-drawer.js'])
-                self.assertEqual(measure.call_count, 1)
-                self.assertTrue(any('O' in r['text'] for r in measure.call_args.args[1]))
-                self.assertEqual(self.hooks[0](painter, font(), 0, 0, 'CCO', self.settings), result)
-                self.assertEqual(measure.call_count, 1)
-                self.assertEqual(evaluate.call_count, 2)
-        finally:
-            painter.end()
+    def test_real_widget_loads_once_and_shapes_with_qt(self):
+        with patch.object(self.runtime, 'eval_file', wraps=self.runtime.eval_file) as evaluate, \
+             patch.object(engine, 'measure_text_runs', wraps=engine.measure_text_runs) as measure, \
+             patch.object(self.feature, 'render', wraps=self.feature.render) as render:
+            self.draw()
+            self.assertEqual([Path(c.args[0]).name for c in evaluate.call_args_list], ['headless.js', 'smiles-drawer.js'])
+            self.assertEqual(measure.call_count, 1)
+            self.assertTrue(any('O' in r['text'] for r in measure.call_args.args[1]))
+            self.assertEqual(render.call_args.args[0], 'CCO')
+            self.assertAlmostEqual(render.call_args.args[1], 12.0, places=7)
+            self.draw()
+            self.assertEqual(measure.call_count, 1)
+            self.assertEqual(evaluate.call_count, 2)
+
+    def test_native_move_rotate_control_and_undo_without_resize(self):
+        helper = self.draw()
+        controls = helper.getControlGraph(self.widget)
+        self.assertEqual(len(controls), 1)
+        control = controls[0]
+        item = control.createGraphicsItem(None)
+        for corner in item.corners:
+            self.assertFalse(corner.isVisible())
+            self.assertFalse(corner.flags() & qt.QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            self.assertEqual(corner.acceptedMouseButtons(), qt.Qt.MouseButton.NoButton)
+        self.assertIsNotNone(item.rotator)
+        self.assertTrue(item.rotator.isVisible())
+        control.posn = [150, 210]
+        control.angle = 37
+        before = {name: list(getattr(self.settings, name))
+                  for name in ('xPos', 'yPos', 'rotate')}
+        self.widget.updateControlItem(control)
+        self.assertEqual(self.settings.size, '12pt')
+        for name, value in [('xPos', .3), ('yPos', .3), ('rotate', 37)]:
+            self.assertAlmostEqual(getattr(self.settings, name)[0], value)
+        self.doc.undoOperation()
+        for name, value in before.items():
+            self.assertEqual(list(getattr(self.settings, name)), value)
+
+    def test_font_size_controls_natural_bounds_and_root_font_color(self):
+        self.settings.get('font').set('Courier New')
+        self.settings.get('color').set('#246824')
+        self.settings.get('colored').set(False)
+        self.settings.get('smiles').set('NCCO')
+        boxes, bounds = [], []
+        for size in (12, 24):
+            self.settings.get('size').set(str(size) + 'pt')
+            with patch.object(engine, 'measure_text_runs', wraps=engine.measure_text_runs) as measure, \
+                 patch.object(self.feature, 'render', wraps=self.feature.render) as render:
+                image, helper = self.painted()
+                self.assertEqual(measure.call_args.args[2].family(), 'Courier New')
+                self.assertAlmostEqual(measure.call_args.args[2].pointSizeF(), size, places=7)
+                self.assertAlmostEqual(render.call_args.args[1], size, places=7)
+                self.assertEqual(render.call_args.args[2], '#246824')
+            ink, colored, box = image_stats(image)
+            self.assertGreater(ink, 50)
+            self.assertGreater(colored, 10)
+            boxes.append(box)
+            bounds.append(helper.getControlGraph(self.widget)[0].dims)
+        for dimension in (0, 1):
+            self.assertAlmostEqual(boxes[1][dimension], boxes[0][dimension] * 2, delta=2)
+            self.assertAlmostEqual(bounds[1][dimension], bounds[0][dimension] * 2, places=6)
+
+    def test_natural_geometry_is_page_independent_and_dpi_aware(self):
+        base_image, base_helper = self.painted(dpi=96)
+        base_box = image_stats(base_image)[2]
+        base_bounds = base_helper.getControlGraph(self.widget)[0].dims
+        for pagesize, dpi, factor in [((1000, 600), 96, 1), ((1000, 600), 192, 2)]:
+            image, helper = self.painted(pagesize, dpi)
+            box = image_stats(image)[2]
+            bounds = helper.getControlGraph(self.widget)[0].dims
+            for dimension in (0, 1):
+                self.assertAlmostEqual(box[dimension], base_box[dimension] * factor, delta=2)
+                self.assertAlmostEqual(bounds[dimension], base_bounds[dimension] * factor, places=6)
+
+    def test_source_changes_update_natural_selection_bounds(self):
+        self.settings.get('smiles').set('CCO')
+        first = self.draw().getControlGraph(self.widget)[0].dims
+        self.settings.get('smiles').set('CCCCCCO')
+        changed = self.draw().getControlGraph(self.widget)[0].dims
+        self.assertNotEqual(tuple(first), tuple(changed))
+        self.settings.get('smiles').set('CCO')
+        restored = self.draw().getControlGraph(self.widget)[0].dims
+        self.assertEqual(tuple(first), tuple(restored))
+        self.settings.get('smiles').set('')
+        self.assertFalse(self.draw().getControlGraph(self.widget))
+
+    def test_graph_parent_is_native_and_invalid_draw_is_visible_recoverable(self):
+        self.commands.Add('graph', name='graph')
+        self.commands.To('graph')
+        self.commands.Add('smiles', name='graphmolecule')
+        child = self.doc.resolveWidgetPath(None, '/' + self.page + '/graph/graphmolecule')
+        self.assertEqual(child.parent.typename, 'graph')
+        self.assertEqual(self.widget.parent.typename, 'page')
+        for source, should_error in [('C1CC', True), ('CCO', False)]:
+            with self.subTest(source=source):
+                child.settings.get('smiles').set(source)
+                image = qt.QImage(500, 300, qt.QImage.Format.Format_ARGB32)
+                image.fill(qt.Qt.GlobalColor.transparent)
+                painter = qt.QPainter(image)
+                try:
+                    with patch.object(self.platform.state, 'note') as note:
+                        helper = veusz.document.PaintHelper(self.doc, (500, 300))
+                        child.draw([10, 10, 490, 290], helper)
+                        helper.renderToPainter(painter)
+                        self.assertEqual(note.called, should_error, note.call_args_list)
+                        if should_error:
+                            self.assertIn('SMILES', note.call_args.args[0])
+                finally:
+                    painter.end()
+                self.assertGreater(image_stats(image)[0], 50, 'invalid input must show a visible diagnostic')
+        helper = veusz.document.PaintHelper(self.doc, (500, 300))
+        child.draw([30, 20, 470, 280], helper)
+        self.assertTrue(helper.getControlGraph(child))
 
     def test_supported_molecules_produce_path_only_svg(self):
         for name, smiles in [('benzene', 'c1ccccc1'), ('ethanol', 'CCO'),
@@ -195,16 +346,28 @@ class SmilesFeatureTests(unittest.TestCase):
                 outlined += 1
         self.assertGreaterEqual(outlined, 2)
 
-    def test_trim_scaling_size_and_font_face_cache(self):
+    def test_point_size_scales_reply_and_is_part_of_cache_key(self):
+        base, _ = self.render('NCCO', size=12)
+        large, asked = self.render('NCCO', size=24)
+        self.assertTrue(asked, 'size changes must not reuse the 12pt cached reply')
+        for dimension in ('width', 'height'):
+            self.assertAlmostEqual(large[dimension], base[dimension] * 2, places=7)
+        cached, asked = self.render('NCCO', size=24)
+        self.assertEqual(cached, large)
+        self.assertFalse(asked)
+        original, asked = self.render('NCCO', size=12)
+        self.assertEqual(original, base)
+        self.assertFalse(asked)
+        for size in (0, -1, 'NaN', 'Infinity'):
+            with self.subTest(size=size):
+                self.assertIn('error', self.first(self.request('CCO', size=size)))
+
+    def test_trim_and_font_face_cache(self):
         base, asked = self.render('CCO')
         self.assertTrue(asked)
         cached, asked = self.render('  CCO \n')
         self.assertEqual(cached, base)
         self.assertFalse(asked)
-        for opts in ({'scale': 2}, {'size': 40}):
-            reply, _ = self.render('CCO', **opts)
-            for dim in ('width', 'height'):
-                self.assertAlmostEqual(reply[dim], base[dim] * 2, places=7)
         bold = font()
         bold.setBold(True)
         changed, asked = self.render('CCO', label=bold)
@@ -239,11 +402,6 @@ class SmilesFeatureTests(unittest.TestCase):
                 self.valid_svg(self.render('CCO')[0])
         self.assertIn('error', self.first(self.request('C' * 4097)))
         self.assertIn('error', self.render('C' * 257)[0])
-        for scale in (0, -1, 0.099, 10.01, 'NaN', 'Infinity'):
-            with self.subTest(scale=scale):
-                self.assertIn('error', self.first(self.request('CCO', scale=scale)))
-        for scale in (0.1, 10):
-            self.valid_svg(self.render('CCO', scale=scale)[0])
         self.assertIn('error', self.first(self.request('CCN', discard=True)))
         self.assertIn('error', self.first(self.request('CCN', measured={})))
 
@@ -268,14 +426,84 @@ class UpstreamExportTests(unittest.TestCase):
     def setUpClass(cls):
         # Never read/write the user's feature enablement preferences. Existing
         # upstream settings are copied in memory; its persistent write is unused.
-        fake = dict(veusz.setting.settingdb.database)
+        fake = copy.copy(veusz.setting.settingdb)
+        fake.database = dict(veusz.setting.settingdb.database)
         fake[engine.FEATURE_DISABLED_KEY] = []
+        cls.qsettings_patch = patch.object(qt, 'QSettings', MemoryQSettings)
+        cls.qsettings_patch.start()
+        cls.addClassCleanup(cls.qsettings_patch.stop)
         cls.preference_patch = patch.object(veusz.setting, 'settingdb', fake)
         cls.preference_patch.start()
         cls.addClassCleanup(cls.preference_patch.stop)
         cls.platform = engine.install(verbose=False)
         cls.feature = next(f for f in cls.platform.feature_objects() if f.name == 'smiles')
         OUT.mkdir(exist_ok=True)
+
+    def test_real_insert_menu_page_graph_and_undo(self):
+        interface = veusz.document.CommandInterface
+        names = interface.import_commands + interface.safe_commands
+        missing = {name for name in names if not hasattr(interface, name)}
+        self.assertLessEqual(missing, {'ImportFITSFile'})
+        imports = [name for name in interface.import_commands if name not in missing]
+        safe = [name for name in interface.safe_commands if name not in missing]
+        APP.clipboard().setMimeData(qt.QMimeData())
+        with patch.object(interface, 'import_commands', imports), \
+             patch.object(interface, 'safe_commands', safe):
+            window = veusz.windows.mainwindow.MainWindow()
+        try:
+            commands = veusz.document.CommandInterface(window.document)
+            page_name = commands.Add('page')
+            commands.To(page_name)
+            commands.Add('graph', name='graph')
+            page = window.document.resolveWidgetPath(None, '/' + page_name)
+            graph = window.document.resolveWidgetPath(None, '/' + page_name + '/graph')
+            action = window.treeedit.vzactions['add.smiles']
+            self.assertIn(action, window.menus['insert'].actions())
+            self.assertEqual(sum(a is action for a in window.menus['insert'].actions()), 1)
+            for parent in (page, graph):
+                window.treeedit.selectWidget(parent)
+                self.assertTrue(action.isEnabled())
+                before = len(parent.children)
+                action.trigger()
+                self.assertEqual(len(parent.children), before + 1)
+                molecule = parent.children[-1]
+                self.assertEqual(molecule.typename, 'smiles')
+                self.assertEqual(molecule.settings.smiles, 'CCO')
+                window.document.undoOperation()
+                self.assertEqual(len(parent.children), before)
+                window.document.redoOperation()
+                self.assertEqual(parent.children[-1].typename, 'smiles')
+        finally:
+            # Avoid modified-document dialogs; all QSettings persistence is fake.
+            window.document.setModified(False)
+            window.close()
+            window.deleteLater()
+            APP.processEvents()
+
+    def test_export_dpi_doubles_pixels_not_point_geometry(self):
+        doc = veusz.document.Document()
+        commands = veusz.document.CommandInterface(doc)
+        page = commands.Add('page')
+        commands.To(page)
+        commands.Set('width', '10cm')
+        commands.Set('height', '6cm')
+        commands.Add('smiles', name='molecule')
+        commands.Set('molecule/smiles', 'NCCO')
+        boxes = []
+        replies = []
+        for dpi in (96, 192):
+            path = OUT / ('font-sized-' + str(dpi) + '.png')
+            with patch.object(self.feature, 'render', wraps=self.feature.render) as render:
+                commands.Export(str(path), dpi=dpi)
+                self.assertTrue(render.called)
+                self.assertAlmostEqual(render.call_args.args[1], 12.0, places=7)
+                args, kwargs = render.call_args
+                replies.append(json.loads(self.feature.render(*args, **kwargs)))
+            boxes.append(image_stats(qt.QImage(str(path)))[2])
+        for dimension in (0, 1):
+            self.assertAlmostEqual(boxes[1][dimension], boxes[0][dimension] * 2, delta=2)
+        for dimension in ('width', 'height'):
+            self.assertAlmostEqual(replies[0][dimension], replies[1][dimension], places=7)
 
     def test_real_page_png_svg_and_document_roundtrip(self):
         doc = veusz.document.Document()
@@ -284,17 +512,17 @@ class UpstreamExportTests(unittest.TestCase):
         commands.To(page)
         commands.Set('width', '10cm')
         commands.Set('height', '6cm')
-        commands.Add('label', name='molecule')
-        commands.Set('molecule/label', '[13CH3][NH3+]')
-        commands.Set('molecule/Text/font', 'Arial')
-        commands.Set('molecule/Text/size', '20pt')
-        commands.Set('molecule/Text/smiles', True)
-        commands.Set('molecule/Text/smilesColored', True)
-        commands.Set('molecule/Text/smilesScale', 1.5)
+        commands.Add('smiles', name='molecule')
+        commands.Set('molecule/smiles', '[13CH3][NH3+]')
+        commands.Set('molecule/font', 'Arial')
+        commands.Set('molecule/color', 'black')
+        commands.Set('molecule/size', '24pt')
+        commands.Set('molecule/rotate', [17])
+        commands.Set('molecule/colored', True)
         outputs = {}
         with patch.object(self.feature, 'render', wraps=self.feature.render) as render:
             for mode in (True, False):
-                commands.Set('molecule/Text/smilesColored', mode)
+                commands.Set('molecule/colored', mode)
                 stem = 'colored' if mode else 'mono'
                 for extension in ('png', 'svg'):
                     path = OUT / (stem + '.' + extension)
@@ -316,19 +544,30 @@ class UpstreamExportTests(unittest.TestCase):
         saved = OUT / 'smiles-roundtrip.vsz'
         commands.Save(str(saved))
         contents = saved.read_text(encoding='utf-8')
-        for setting in ('smiles', 'smilesColored', 'smilesScale'):
-            self.assertIn(setting, contents)
+        self.assertIn("Add('smiles'", contents)
+        for name in ('smiles', 'colored', 'size', 'rotate'):
+            self.assertIn(name, contents)
+        for name in ('Text/smiles', 'smilesColored', 'smilesScale'):
+            self.assertNotIn(name, contents)
         restored = veusz.document.Document()
         # Upstream advertises optional FITS import commands even when astropy
         # is absent. Exclude only uninstalled commands; execute its real loader.
         interface = veusz.document.CommandInterface
-        available = [name for name in interface.safe_commands if hasattr(interface, name)]
+        missing = {name for name in interface.safe_commands if not hasattr(interface, name)}
+        self.assertLessEqual(missing, {'ImportFITSFile'})
+        available = [name for name in interface.safe_commands if name not in missing]
         with patch.object(interface, 'safe_commands', available):
             restored.load(str(saved))
-        settings = restored.resolveWidgetPath(None, '/' + page + '/molecule').settings.Text
-        self.assertTrue(settings.smiles)
-        self.assertFalse(settings.smilesColored)
-        self.assertEqual(settings.smilesScale, 1.5)
+        widget = restored.resolveWidgetPath(None, '/' + page + '/molecule')
+        self.assertEqual(widget.typename, 'smiles')
+        settings = widget.settings
+        self.assertEqual(settings.smiles, '[13CH3][NH3+]')
+        self.assertFalse(settings.colored)
+        self.assertEqual(settings.size, '24pt')
+        self.assertNotIn('width', settings)
+        self.assertNotIn('height', settings)
+        self.assertEqual(settings.rotate, [17])
+        self.assertEqual(settings.font, 'Arial')
 
 
 if __name__ == '__main__':

@@ -38,7 +38,17 @@
      *
      * `target` is what kind of thing it applies to: 'text' means every text
      * element in the document has its own copy of the properties below, and
-     * that the renderer is asked once per text element.
+     * that the renderer is asked once per text element. 'widget' registers a
+     * standalone Veusz widget whose type is the feature's name, with properties
+     * local to each instance and native position/size/rotation controls. Its
+     * optional `source` names the property also passed as req.text.
+     * Widget `sizing: 'font'` supplies a widget-local point-size setting, passes
+     * it as req.size, and uses returned dimensions in points as natural size
+     * instead of fitting to an adjustable width/height box.
+     *
+     *   veusz.feature({name: 'diagram', title: 'Diagram', target: 'widget',
+     *                  source: 'input'});
+     *   veusz.text('input', {default: ''});
      */
     veusz.feature = function (declared) {
         Object.keys(declared || {}).forEach(function (key) {
@@ -81,6 +91,8 @@
      *            document's own words matter -- for instance when the feature
      *            has been writing them since before it was JavaScript, and
      *            renaming them would untick every formula in an old file.
+     *            For target 'widget', the default is simply `name`: each widget
+     *            already owns a separate settings tree.
      *
      *   veusz.switch('on', {setting: 'mathjax', label: 'MathJax'});
      *
@@ -112,6 +124,13 @@
      *       return veusz.svg(someDrawing(req.text), {width: 12, height: 9,
      *                                                depth: 2});
      *   });
+     *
+     * Widget features use veusz.renderWidget(fn) with the same request/reply
+     * protocol. A decline leaves their box empty, not a fallback text label.
+     * By default, geometry is aspect-fitted to the user-resizable box;
+     * width/height describe the drawing's natural aspect ratio. With widget
+     * sizing:'font', width/height are the natural physical dimensions in points,
+     * calculated by the feature from req.size; the host does not fit them.
      */
     veusz.renderText = function (fn) { painter = fn; return veusz; };
     veusz.renderWidget = function (fn) { painter = fn; return veusz; };
@@ -120,7 +139,9 @@
      * An SVG and the box it occupies, in points: `width` and `height` are the
      * whole box, `depth` is how far it reaches below the baseline.  That is the
      * entire drawing contract -- the platform puts the box where the text would
-     * have gone, aligns it by the baseline and paints the SVG into it.
+     * have gone, aligns it by the baseline and paints the SVG into it. For a
+     * widget there is no text baseline: box-sized widgets scale uniformly to
+     * their box, while font-sized widgets use these point dimensions directly.
      *
      * Working out the box is the feature's business, because only the feature
      * knows what its own geometry means.  A feature drawing in `ex` units must

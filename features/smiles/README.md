@@ -1,6 +1,7 @@
-# SMILES molecular structures
+# SMILES molecule widget
 
-Draw a **two-dimensional molecular structure** directly in a Veusz text label.
+Draw a **two-dimensional molecular structure** as an independent Veusz widget.
+It is not a text renderer and adds nothing to labels' or axes' Text settings.
 Powered by **SmilesDrawer 2.4.1**, running offline in the platform's QuickJS
 engine. No browser, WebGL, Node.js, remote service or extra binary is needed.
 
@@ -9,26 +10,77 @@ engine. No browser, WebGL, Node.js, remote service or extra binary is needed.
 1. Install `veusz_js_engine.py` in Veusz's plugin preferences and restart.
 2. Ensure **smiles** is enabled in **Tools -> JS Engine Features...**. Global
    enablement changes take effect after restarting Veusz.
-3. Add a label and enter a SMILES string, for example `CCO`.
-4. In the label's **Text** settings, check **SMILES**.
+3. Select a page or graph and choose **Insert -> SMILES molecule**.
+4. Enter a SMILES string, for example `CCO`, in the widget's **SMILES** property.
+5. Set its own **Font size**, for example `12pt` or `18pt`, to size the structure.
+   Move or rotate the widget with the selection controls, or edit its position
+   and rotation properties.
 
-The existing label remains a normal Veusz object: move, align, rotate and save it
-as usual. The SMILES string and display settings stay in the `.vsz` document.
-Enable only one renderer (SMILES, MathJax or KaTeX) on a given text element;
-otherwise the first enabled renderer in feature discovery order claims it.
+The document tree contains a real `smiles` object, separate from ordinary labels.
+Its structure and display settings are saved in `.vsz`; insertion and native
+geometry changes participate in Veusz undo/redo. A caption, if needed, is a
+separate ordinary label and may independently use MathJax or KaTeX.
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `Text/smiles` | `False` | Interpret the label text as SMILES rather than ordinary text |
-| `Text/smilesColored` | `True` | Element colors; off uses the label's text color |
-| `Text/smilesScale` | `1` | Overall structure scale, from 0.1 to 10 |
-| Existing Text font/size | label's values | Atom label font and base diagram size |
+| Widget setting | Meaning |
+|---|---|
+| `smiles` | Molecular structure string; default `CCO` |
+| `colored` | Element colors, enabled by default; off uses the widget's `color` |
+| `xPos`, `yPos` | Native Veusz position lists; default center of the container |
+| `size` | Widget-local font size, default `12pt`; controls the whole structure |
+| `rotate` | Native Veusz rotation angles in degrees |
+| `hide` | Hide the widget without rendering it |
+| `positioning`, `xAxis`, `yAxis` | Native relative or graph-axis positioning |
+| `font` | Widget-local atom-label font family (formatting); default Arial |
+| `color` | Widget-local monochrome drawing color (formatting); default black |
 
-Settings are registered at startup, but `headless.js` and `smiles-drawer.js` are
-**loaded once on the first enabled, nonempty drawing**. Ordinary labels and empty
-SMILES labels do not load them. Completed drawings are cached by source, size,
-scale, color mode, text color and font identity (up to 128 entries per runtime).
-Globally disabling the feature prevents even its entry point from running.
+The drawing has a **natural size determined by its own font size**. Changing
+`12pt` to `24pt` doubles both the atom labels and bond geometry. Molecules at the
+same font size share the same nominal atom-label and bond scale, rather than
+being squeezed into identical boxes. Page size does not change that physical
+scale; export DPI changes only the number of pixels used to represent it.
+
+The selection box follows the rendered structure and has move/rotation controls,
+not resize handles. There are no `width` or `height` properties. Rotation is
+around the structure center. Native position/rotation settings accept lists or
+datasets; none of this adds settings to ordinary text labels.
+
+For a document script:
+
+```python
+Add('page', name='page1', autoadd=False)
+To('page1')
+Add('smiles', name='molecule1', autoadd=False)
+Set('molecule1/smiles', 'N[C@@H](C)C(=O)O')
+Set('molecule1/xPos', [0.5])
+Set('molecule1/yPos', [0.5])
+Set('molecule1/size', '14pt')
+```
+
+### Previous text-label prototype
+
+The previous `Text/smiles`, `Text/smilesColored` and `Text/smilesScale` settings
+are removed, not kept as hidden text switches. Old prototype documents are not
+automatically migrated: replace molecular `label` objects with `smiles` objects,
+move the source from `label` to `smiles`, and preserve positions.
+`Text/smilesColored` becomes `colored`, `Text/font` becomes `font`, and
+`Text/size` becomes the widget's own `size`. If the prototype used a non-default
+`Text/smilesScale`, multiply its font size by that scale. Remove the old Text
+settings; the widget is positioned by its center instead of label alignment.
+
+For the intermediate box-sized widget prototype, remove `width`/`height` and
+set `size` in points instead. There is no automatic conversion from its fitted
+box to a font size. The bundled example uses font sizes already.
+
+## Lazy loading
+
+The widget type and its properties are registered at startup, but `headless.js`
+and `smiles-drawer.js` are **loaded once on the first visible, nonempty drawing**.
+Creating a widget, hiding it, or leaving its source empty does not load them.
+Completed drawings are cached by source, font size, color mode, drawing color
+and font identity (up to 128 entries per runtime). Moving/rotating a widget
+reuses the same geometry. Globally disabling the feature prevents even its entry point
+from running: its widget type and Insert action are then unavailable. Enable
+it and restart before opening documents which contain `smiles` widgets.
 
 ## Examples
 
@@ -43,25 +95,22 @@ Globally disabling the feature prevents even its entry point from running.
 | Separate ionic fragments | `[Na+].[Cl-]` |
 
 Open **[examples/molecules.vsz](examples/molecules.vsz)** after enabling the
-plugin to see six examples on one page. No external molecule files are needed.
+plugin to see six independent molecule widgets with normal label captions.
+No external molecule files are needed.
 
 ## Rendering and limits
 
 - Rings, double/triple bonds, solid/hashed stereobonds, isotopes, charges and
   hydrogen subscripts are produced by SmilesDrawer's parser/layout.
-- Atom labels are measured and outlined by Qt in the label's font using the
-  platform's existing two-pass measurement protocol. Final drawings contain
-  **vector geometry, not browser text or bitmap screenshots**.
+- Atom labels are measured and outlined by Qt in the widget's font using the
+  platform's measurement protocol. Final drawings contain **vector geometry,
+  not browser text or bitmap screenshots**.
 - Backgrounds are transparent. Upstream label masks are subtracted from bond
   geometry, avoiding opaque rectangles and relying on neither CSS transforms
   nor SVG mask support in the target Qt version. Circular wedge cuts use a
   fine polygon approximation.
-- Size follows the label font size; Structure scale then enlarges/shrinks the
-  entire diagram. The base upstream 11 pt label corresponds to 14.6667 SVG
-  CSS-pixel units. Diagram depth is zero (bottom baseline); normal Veusz
-  alignment positions the whole box.
 - Malformed syntax, unmatched/self ring closures, missing font outlines and
-  drawing failures are displayed as errors, rather than silently hiding labels.
+  drawing failures are shown inside the widget; other objects keep drawing.
 - Up to **4096 input characters and 256 parsed atoms** per structure. These are
   interactive drawing limits, not a substitute for chemistry validation.
 - This is a depiction tool, **not a chemical valence/aromaticity validator**, a
@@ -74,13 +123,16 @@ plugin to see six examples on one page. No external molecule files are needed.
 
 ## Files and provenance
 
-- `feature.js`: feature settings, lazy-load handshake, cache and size conversion.
+- `feature.js`: widget declaration, properties, lazy-load handshake and cache.
 - `headless.js`: feature-local SVG element builder and metric-only canvas shim,
   label outlining and portable bond clipping. Not a general DOM implementation.
 - `smiles-drawer.js`: **unmodified** `dist/smiles-drawer.min.js` from the official
   npm package `smiles-drawer@2.4.1`; includes `chroma-js@2.4.2`.
 - `LICENSE-SMILESDRAWER.txt`: upstream MIT license.
 - `LICENSE-CHROMA.txt`: bundled chroma-js BSD-3-Clause and ColorBrewer notice.
+
+The Python platform supplies the generic `target: 'widget'` integration. There
+is no SMILES-specific Python widget or molecular drawing code in the platform.
 
 Bundle SHA-256:
 `6b0397cd52a708eeafb995f191d6d972449377e5603ae603cb210f537666fddc`
@@ -107,8 +159,10 @@ python features/smiles/test/test_smiles_feature.py
 ```
 
 Tests explicitly use the sibling `upstream-veusz` checkout with PyQt6 and the
-platform's QuickJS library. They exercise real cold/warm rendering, atom glyph
-outlines, stereo/isotope/charge examples, transparent SVGs, input limits, scale,
-font/color cache separation, real PNG/SVG export, and `.vsz` save/load settings.
-Outputs are in the workspace's ignored `build-test-smiles/` directory. Tests do
-not save feature preferences to the user's settings database.
+platform's QuickJS library. They exercise real widget creation, absence of Text
+injection, cold/warm rendering, atom glyph outlines, stereo/isotope/charge
+examples, natural selection bounds, movement/rotation controls, font-size and
+DPI scaling, page-size independence, font/color cache separation, actual PNG/SVG
+export, and `.vsz` save/load. Outputs are in the workspace's ignored
+`build-test-smiles/` directory. Tests do not save feature preferences to the
+user's settings database.

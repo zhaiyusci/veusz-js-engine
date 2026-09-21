@@ -14,15 +14,15 @@ veusz-js-engine (this plugin)                      the platform
     a JavaScript API a feature is written against
     Veusz plumbing, written once for every feature:
         the properties panel, from what the feature declares
-        the text seam, and the drawing of the SVG it returns
-        the box: where it goes, how big, aligned by its baseline
+        text rendering or a standalone widget, from the declared target
+        SVG placement: a text baseline or a movable, resizable widget box
         |
         v
 a feature (e.g. features/mathjax/feature.js)       concrete
     JavaScript only: declares what to add, returns an SVG
         |
         v
-the feature the user sees: one row in the Text properties
+the feature the user sees: Text properties, or an Insert-menu widget
 ```
 
 The point of the split is that the awkward part — the monkey patching that
@@ -60,9 +60,12 @@ With no features enabled, there are no feature-specific settings rows.
 
 Shipped features: **[MathJax](features/mathjax/README.md)**,
 **[KaTeX](features/katex/README.md)**, and
-**[SMILES molecular structures](features/smiles/README.md)**. For SMILES, enter a
-molecule such as `CCO` in a label and enable its **Text → SMILES** checkbox.
-The structure is drawn as vectors; its atom labels use the label's font.
+**[SMILES molecule widget](features/smiles/README.md)**. For SMILES, select a page
+or graph, choose **Insert → SMILES molecule**, and enter a molecule such as `CCO`
+in its own **SMILES** property. Set its own **Font size** to size the structure,
+and move or rotate it using the selection controls. Its selection box follows
+its natural size, independently of page dimensions. It renders vectors and does
+not add anything to ordinary Text/font settings.
 
 ```
 veusz-js-engine/               this repository: the platform
@@ -231,6 +234,44 @@ properties — an axis label and its tick numbers are separate. The kinds are
 `switch`, `choice`, `text` and `number`, and which Veusz control each becomes
 is the platform's business: a feature says `switch` and gets a checkbox
 without ever learning that Veusz calls it `Bool`.
+
+### Standalone widgets
+
+A feature can instead declare `target: 'widget'`. Its name becomes a native
+Veusz widget type, available from **Insert** and `Add('name')`, with an independent
+settings tree, positioning, rotation and undo/redo. By default it uses a resizable
+bounding box; `sizing: 'font'` opts into font-sized natural dimensions instead.
+This does not inject settings into `Text` or register a text-rendering hook.
+
+```js
+veusz.feature({name: 'diagram', title: 'Diagram', target: 'widget',
+               source: 'input'});
+veusz.text('input', {label: 'Input', default: ''});
+veusz.renderWidget(function (req) {
+    if (!req.get('input')) { return null; }
+    return veusz.svg(drawDiagram(req.get('input')),
+                     {width: 100, height: 60, depth: 0});
+});
+```
+
+The optional `source` names a declared property also mirrored into `req.text`.
+For widgets, an unspecified `setting` defaults to the property's bare name;
+there is no need for a prefix inside the widget's own settings tree. Property
+names must not collide with native geometry, the widget-local `font`/`color`,
+or `size` when using font sizing.
+The platform uses the same deferred-load and Qt text-outline protocol as text
+features. It fits the returned SVG uniformly inside the widget box, preserving
+aspect ratio; dimensions describe intrinsic drawing proportions rather than
+forcing a physical size. `null` means an empty box; errors are drawn locally.
+
+A widget declaring **`sizing: 'font'`** instead gets its own `size` setting
+(default `12pt`), with no `width`/`height` controls. The host passes that point
+size as `req.size`; the feature returns natural width/height **in points**. The
+platform converts those to painter units without fitting them to a container.
+The selection box follows the returned dimensions; moving and rotating are
+supported, but resizing the box cannot override the font size. Page dimensions
+do not change the drawing's physical size. See
+[the SMILES feature](features/smiles/feature.js) for a complete font-sized example.
 
 ### A property has two names, and the feature declares both
 

@@ -2242,8 +2242,9 @@ def _js_load_order(entry, feature_dir):
 
 #: what kind of thing a feature may apply to.  ``text`` means every text
 #: element -- an axis label, a tick number, a key -- has its own copy of the
-#: properties, and the renderer is asked once per element.
-JS_TARGETS = ('text',)
+#: properties, and the renderer is asked once per element. ``widget`` creates
+#: an independent native box, with its own settings and drawing callback.
+JS_TARGETS = ('text', 'widget')
 
 
 class JsFeature(object):
@@ -2281,9 +2282,11 @@ class JsFeature(object):
         ``setting`` is optional.  Left out, the platform qualifies the name
         with the feature's own (``mathjax_on``), which is what stops two
         features from colliding over something as short as ``on``; a feature
-        that wants the document's own words names them itself.
+        that wants the document's own words names them itself. Widget-local
+        properties need no namespace and default to the bare property name.
         """
-        return prop.get('setting') or '%s_%s' % (self.name, prop['name'])
+        return prop.get('setting') or (prop['name'] if self.target == 'widget'
+                                       else '%s_%s' % (self.name, prop['name']))
 
     def read(self, settings):
         """This feature's property values for one text element, or None.
@@ -2574,6 +2577,353 @@ def load_feature_file(feature, name):
     feature.runtime.loaded_scripts.add(candidate)
 
 
+def _widget_reply(platform, feature, settings, font, color, qt, size_pt=12.0):
+    """Complete the generic deferred-load/text-measurement protocol."""
+    props = feature.read(settings)
+    if props is None:
+        raise JsEngineError('widget properties are missing')
+    text = str(props.get(feature.source, '')) if feature.source else ''
+    face = text_font_key(qt, font)
+    requested_files = set()
+    measured = None
+    discard = False
+    for _step in range(64):
+        reply = _decode_reply(feature.render(
+            text, size_pt, color, props, face=face, measured=measured,
+            discard=discard))
+        if reply is None:
+            return None
+        if 'load' in reply:
+            requested = str(reply['load'])
+            canonical = (Path(feature.feature_dir or feature.entry.parent)
+                         / requested).resolve()
+            if canonical in requested_files or len(requested_files) >= 32:
+                raise JsEngineError('repeated or excessive deferred load')
+            requested_files.add(canonical)
+            load_feature_file(feature, requested)
+        elif 'measure' in reply:
+            try:
+                measured = measure_text_runs(qt, reply['measure'], font)
+            except TextOutlineUnavailable as exc:
+                platform.state.note(str(exc))
+                if discard:
+                    raise
+                discard = True
+                measured = None
+        else:
+            if reply.get('note'):
+                platform.state.note('%s: %s' % (feature.name, reply['note']))
+            return reply
+    raise JsEngineError('excessive widget rendering requests')
+
+
+def _prepare_js_widget(platform, feature, widget, painter):
+    """One protocol/layout pass; return renderer, physical box, font and error."""
+    import math
+    import veusz.qtall as qt
+
+    size_pt = 12.0
+    font = qt.QFont(widget.settings.font)
+    try:
+        if getattr(feature, 'sizing', 'box') == 'font':
+            size_pt = (widget.settings.get('size').convert(painter)
+                       / _painter_pixperpt(painter))
+        if not math.isfinite(size_pt) or size_pt <= 0:
+            raise JsEngineError('font size must be positive and finite')
+        font.setPointSizeF(size_pt)
+        color = widget.settings.get('color').color(painter).name()
+        reply = _widget_reply(platform, feature, widget.settings, font, color,
+                              qt, size_pt=size_pt)
+        if reply is None:
+            return
+        if reply.get('error'):
+            raise JsEngineError(str(reply['error']))
+        markup = reply.get('svg')
+        if not markup:
+            raise JsEngineError('widget renderer did not return SVG')
+        # Unlike the historical text seam, keep every stroke width and every
+        # explicit library color. Only currentColor needs Qt adaptation.
+        markup = re.sub(r'\b(fill|stroke)=([\"\'])currentColor\2',
+                        lambda m: '%s=%s%s%s' % (m[1], m[2], color, m[2]),
+                        markup)
+        width = _as_float(reply.get('width'))
+        height = _as_float(reply.get('height'))
+        encoded = markup.encode('utf-8')
+        encoded, leftover = svg_text_as_paths(
+            qt, encoded, font.family(),
+            em_in_user_units(encoded, width or 0, size_pt))
+        if leftover:
+            encoded = cancel_qt_text_factor(qt, encoded, painter)
+        renderer = _svg_renderer(qt, encoded)
+        if renderer is None or not renderer.isValid():
+            raise JsEngineError('widget renderer returned invalid SVG')
+        intrinsic = renderer.viewBoxF()
+        if width is None or height is None:
+            width, height = intrinsic.width(), intrinsic.height()
+        if not all(math.isfinite(v) and v > 0 for v in (width, height)):
+            raise JsEngineError('widget renderer returned invalid dimensions')
+        return renderer, width, height, font, None
+    except Exception as exc:
+        # Errors belong to this widget, not to the document's text renderer.
+        message = '%s: %s' % (feature.title, exc)
+        platform.state.note(message)
+        size_pt = size_pt if math.isfinite(size_pt) and size_pt > 0 else 12.0
+        font.setPointSizeF(size_pt)
+        return None, size_pt * 16, size_pt * 4, font, message
+
+
+def _paint_js_widget(painter, rect, prepared):
+    """Draw an already prepared SVG, preserving its aspect and stroke widths."""
+    import veusz.qtall as qt
+
+    if prepared is None or rect.isEmpty():
+        return
+    renderer, width, height, font, message = prepared
+    painter.save()
+    try:
+        if message:
+            painter.setPen(qt.QPen(qt.QColor('#b00020')))
+            painter.setBrush(qt.QBrush(qt.Qt.BrushStyle.NoBrush))
+            painter.setFont(font)
+            painter.drawRect(rect)
+            painter.drawText(rect, int(qt.Qt.AlignmentFlag.AlignCenter
+                                      | qt.Qt.TextFlag.TextWordWrap), message)
+        else:
+            scale = min(rect.width() / width, rect.height() / height)
+            fitted = qt.QRectF(0, 0, width * scale, height * scale)
+            fitted.moveCenter(rect.center())
+            renderer.render(painter, fitted)
+    finally:
+        painter.restore()
+
+
+def _draw_js_widget(platform, feature, widget, painter, rect):
+    rect = rect.normalized()
+    if not rect.isEmpty():
+        _paint_js_widget(painter, rect,
+                         _prepare_js_widget(platform, feature, widget, painter))
+
+
+def _font_widget_control(widget, phelper, posn, dims, angle):
+    """Native move/rotate box, with resize handles disabled and hidden."""
+    from veusz.widgets import controlgraph
+    import veusz.qtall as qt
+
+    class FixedSizeBox(controlgraph.ControlResizableBox):
+        def createGraphicsItem(self, parent):
+            item = super().createGraphicsItem(parent)
+            for corner in item.corners:
+                corner.setFlag(qt.QGraphicsItem.GraphicsItemFlag.ItemIsMovable,
+                               False)
+                corner.setAcceptedMouseButtons(qt.Qt.MouseButton.NoButton)
+                corner.hide()
+            return item
+
+    return FixedSizeBox(widget, phelper, posn, dims, angle, allowrotate=True)
+
+
+def _draw_font_js_widget(platform, feature, widget, posn, phelper):
+    """Natural-size placement using native coordinates, clipping and controls."""
+    import itertools
+    import veusz.qtall as qt
+
+    s = widget.settings
+    if s.hide:
+        return
+    props = feature.read(s)
+    if feature.source and props is not None and not str(
+            props.get(feature.source, '')).strip():
+        return
+    xpos, ypos = widget._getPlotterCoords(posn)
+    rotate = s.get('rotate').getFloatArray(widget.document)
+    if (xpos is None or ypos is None or rotate is None
+            or not len(xpos) or not len(ypos) or not len(rotate)):
+        return
+    clip = (qt.QRectF(qt.QPointF(posn[0], posn[1]),
+                     qt.QPointF(posn[2], posn[3])) if s.clip else None)
+    painter = phelper.painter(widget, posn, clip=clip)
+    phelper.setControlGraph(widget, [])
+    controls = []
+    editable = not any(s.get(name).isDataset(widget.document)
+                       for name in ('xPos', 'yPos', 'rotate'))
+    with painter:
+        prepared = _prepare_js_widget(platform, feature, widget, painter)
+        if prepared is None:
+            return
+        pixperpt = _painter_pixperpt(painter)
+        width, height = prepared[1] * pixperpt, prepared[2] * pixperpt
+        rect = qt.QRectF(-width * 0.5, -height * 0.5, width, height)
+        for index, (x, y, angle) in enumerate(zip(
+                xpos, ypos, itertools.cycle(rotate))):
+            painter.save()
+            try:
+                painter.translate(x, y)
+                painter.rotate(angle)
+                _paint_js_widget(painter, rect, prepared)
+            finally:
+                painter.restore()
+            if editable:
+                control = _font_widget_control(
+                    widget, phelper, [x, y], [width, height], angle)
+                control.index = index
+                control.widgetposn = posn
+                controls.append(control)
+    phelper.setControlGraph(widget, controls)
+
+
+def _update_font_widget_control(widget, control):
+    """Move/rotate through the document undo stack; never persist dimensions."""
+    from veusz import document
+
+    x, y = widget._getGraphCoords(
+        control.widgetposn, control.posn[0], control.posn[1])
+    if x is None or y is None:
+        return
+    operations = []
+    for name, value in (('xPos', float(x)), ('yPos', float(y)),
+                        ('rotate', control.angle)):
+        setting = widget.settings.get(name)
+        values = list(setting.getFloatArray(widget.document))
+        values[min(control.index, len(values) - 1)] = value
+        operations.append(document.OperationSettingSet(setting, values))
+    widget.document.applyOperation(document.OperationMultiple(
+        operations, descr='move or rotate widget'))
+
+
+def _install_widget_insert_actions():
+    """Extend native insertion for existing/future editors, once per class."""
+    import veusz.qtall as qt
+    from veusz import document
+    from veusz.windows.treeeditwindow import TreeEditDock
+    from veusz.utils import action as action_utils
+
+    def add_actions(editor):
+        menu = editor.parentwin.menus.get('insert')
+        if menu is None:
+            return
+        for cls in document.thefactory.listWidgetClasses():
+            if not getattr(cls, '_js_engine_widget_entry', None):
+                continue
+            key = 'add.' + cls.typename
+            if key in editor.vzactions:
+                continue
+            slot = lambda checked=False, wc=cls: editor.slotMakeWidgetButton(wc)
+            action = qt.QAction(cls.description, editor)
+            # The native tree requests button_<typename> too. Supply the
+            # existing SVG icon via its cache, never a feature-specific asset.
+            icon_name = 'button_' + cls.typename
+            icon = action_utils.getIcon(icon_name)
+            if icon.isNull():
+                icon = action_utils.getIcon('button_svgfile')
+                action_utils._iconcache[icon_name] = icon
+            action.setIcon(icon)
+            action.setObjectName(key)
+            action.setToolTip(cls.description)
+            action.triggered.connect(slot)
+            editor.addslots[cls] = slot
+            editor.vzactions[key] = action
+            menu.addAction(action)
+            selected = editor.selwidgets[0] if editor.selwidgets else None
+            while selected is not None and not cls.willAllowParent(selected):
+                selected = selected.parent
+            action.setEnabled(selected is not None)
+
+    if not getattr(TreeEditDock, '_js_engine_widget_menu_hooked', False):
+        original = TreeEditDock._constructToolbarMenu
+
+        def construct(editor, *args, **kwargs):
+            result = original(editor, *args, **kwargs)
+            add_actions(editor)
+            return result
+
+        TreeEditDock._constructToolbarMenu = construct
+        TreeEditDock._js_engine_widget_menu_hooked = True
+    app = qt.QApplication.instance()
+    if app is not None:
+        for editor in app.allWidgets():
+            if isinstance(editor, TreeEditDock) and hasattr(editor, 'addslots'):
+                add_actions(editor)
+
+
+def install_js_widget(platform, feature, declared):
+    """Register a user-creatable native box for a JS widget declaration."""
+    from veusz import document, setting
+    from veusz.widgets.shape import BoxShape
+
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', feature.name):
+        raise JsEngineError('invalid widget type name %r' % feature.name)
+    sizing = getattr(feature, 'sizing', 'box')
+    if sizing not in ('box', 'font'):
+        raise JsEngineError('unknown widget sizing %r' % sizing)
+    entry = str(Path(feature.entry).resolve())
+    existing = document.thefactory.regwidgets.get(feature.name)
+    if existing is not None:
+        if getattr(existing, '_js_engine_widget_entry', None) != entry:
+            raise JsEngineError('widget type %r is already registered' % feature.name)
+        # Re-exec retains the original class, its instances and its closures.
+        feature = existing._js_engine_feature
+    else:
+        class JsWidget(BoxShape):
+            typename = feature.name
+            description = feature.title
+            allowusercreation = True
+            _js_engine_widget_entry = entry
+            _js_engine_feature = feature
+
+            @classmethod
+            def addSettings(cls, s):
+                BoxShape.addSettings(s)
+                if sizing == 'font':
+                    s.remove('width')
+                    s.remove('height')
+                    s.add(setting.DistancePt(
+                        'size', '12pt', usertext='Font size',
+                        descr='Font size controlling the whole drawing',
+                        formatting=False), posn=0)
+                else:
+                    s.get('width').newDefault([0.2])
+                    s.get('height').newDefault([0.2])
+                # BoxShape.draw needs Border, but neither group is relevant UI.
+                for group in ('Border', 'Fill'):
+                    s.get(group).get('hide').newDefault(True)
+                    s.get(group).setnsmode = 'hide'
+                s.add(setting.FontFamily('font', 'Arial', usertext='Font',
+                                         formatting=True))
+                s.add(setting.Color('color', 'black', usertext='Color',
+                                    formatting=True))
+                for member, prop in declared:
+                    s.add(member.copy(), posn=0 if prop['name'] == feature.source
+                          else -1)
+
+            def drawShape(self, painter, rect):
+                _draw_js_widget(platform, feature, self, painter, rect)
+
+            def draw(self, posn, phelper, outerbounds=None):
+                if sizing == 'font':
+                    return _draw_font_js_widget(
+                        platform, feature, self, posn, phelper)
+                return super().draw(posn, phelper, outerbounds=outerbounds)
+
+            def updateControlItem(self, control):
+                if sizing == 'font':
+                    return _update_font_widget_control(self, control)
+                return super().updateControlItem(control)
+
+        # Validate all setting names before the factory is changed, including
+        # collisions with native geometry/formatting and duplicate properties.
+        JsWidget.addSettings(setting.Settings('widget'))
+        if feature.source and feature.source not in {
+                prop['name'] for prop in feature.properties}:
+            raise JsEngineError('widget source must name a declared property')
+        document.thefactory.register(JsWidget)
+        existing = JsWidget
+    feature.widget_class = existing
+    if feature not in platform._features:
+        platform._features.append(feature)
+    _install_widget_insert_actions()
+    return feature
+
+
 def install_js_feature(platform, entry, feature_dir, name):
     """Install one JavaScript feature from what it declares about itself.
 
@@ -2605,7 +2955,8 @@ def install_js_feature(platform, entry, feature_dir, name):
         raise JsEngineError('%s: properties must be a list' % entry.name)
 
     target_class = collections.Text
-    renderer_class = platform._svg_renderer_class()
+    renderer_class = (platform._svg_renderer_class()
+                      if target == 'text' else None)
 
     feature = JsFeature(
         name=declaration.get('name') or name,
@@ -2638,6 +2989,11 @@ def install_js_feature(platform, entry, feature_dir, name):
     for members in rows.values():
         if len(members) > 1:
             _merge_into_one_row(qt, members)
+
+    if target == 'widget':
+        feature.source = declaration.get('source')
+        feature.sizing = declaration.get('sizing', 'box')
+        return install_js_widget(platform, feature, declared)
 
     for member, _prop in declared:
         platform.add_setting(target_class, None, member)

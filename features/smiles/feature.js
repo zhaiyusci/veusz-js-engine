@@ -5,36 +5,30 @@
  */
 (function () {
     'use strict';
-    veusz.feature({name: 'smiles', title: 'SMILES molecular structures',
-                   target: 'text', version: '0.1.0'});
-    veusz.switch('on', {
-        setting: 'smiles', label: 'SMILES', default: false, row: 'molecule',
-        descr: 'Interpret this text as a SMILES molecule and draw its 2D structure. '
-             + 'Use only one renderer (SMILES, MathJax or KaTeX) per text element.'
+    veusz.feature({name: 'smiles', title: 'SMILES molecule',
+                   target: 'widget', source: 'smiles', sizing: 'font',
+                   version: '0.3.0'});
+    veusz.text('smiles', {
+        setting: 'smiles', label: 'SMILES', default: 'CCO',
+        descr: 'SMILES molecular structure, for example CCO or c1ccccc1.'
     });
     veusz.switch('colored', {
-        setting: 'smilesColored', label: 'Element colors', default: true,
-        row: 'molecule',
-        descr: 'Use element colors; off draws the structure in the text color.'
-    });
-    veusz.number('scale', {
-        setting: 'smilesScale', label: 'Structure scale', default: 1,
-        descr: 'Scale the structure relative to the text font size (0.1 to 10).'
+        setting: 'colored', label: 'Element colors', default: true,
+        descr: 'Use element colors; off uses the molecule widget color.'
     });
 
     var cache = Object.create(null);
     var cacheSize = 0;
-    veusz.renderText(function (req) {
-        if (!req.on('on')) { return null; }
-        var source = String(req.text == null ? '' : req.text).trim();
+    veusz.renderWidget(function (req) {
+        var input = req.get('smiles');
+        var source = String(input == null ? '' : input).trim();
         if (!source) { return null; }
         if (source.length > 4096) {
             return veusz.error('SMILES input is limited to 4096 characters.');
         }
-        var scale = req.get('scale');
-        scale = scale === undefined ? 1 : Number(scale);
-        if (!isFinite(scale) || scale < 0.1 || scale > 10) {
-            return veusz.error('SMILES structure scale must be between 0.1 and 10.');
+        var size = Number(req.size);
+        if (!(size > 0) || !isFinite(size)) {
+            return veusz.error('SMILES font size must be positive and finite.');
         }
         if (req.discard) {
             return veusz.error('SMILES atom labels need a font with glyph outlines; '
@@ -46,10 +40,9 @@
         if (!globalThis.window || !globalThis.window.SmilesDrawer) {
             return JSON.stringify({load: 'smiles-drawer.js'});
         }
-        var size = req.size > 0 && isFinite(req.size) ? req.size : 12;
         var colored = req.get('colored') !== false;
         var color = /^#[0-9a-f]{6}$/i.test(req.color || '') ? req.color : '#000000';
-        var key = JSON.stringify([source, size, scale, colored, color, req.face || '']);
+        var key = JSON.stringify([source, size, colored, color, req.face || '']);
         if (!req.measured && cache[key] !== undefined) { return cache[key]; }
         try {
             var request = {smiles: source, measured: req.measured,
@@ -66,11 +59,16 @@
                     || !isFinite(result.width) || !isFinite(result.height)) {
                 return veusz.error('SMILES drawer returned invalid geometry.');
             }
-            // Upstream labels use 11 pt, i.e. 11 * 4/3 SVG CSS pixels.
-            // Match the label's font size, then apply the optional diagram scale.
-            var factor = size * scale / (11 * 4 / 3);
-            var reply = veusz.svg(result.svg, {width: result.width * factor,
-                                               height: result.height * factor,
+            // Upstream 11 pt labels occupy 11 * 4/3 SVG CSS-pixel units.
+            // Return natural dimensions in points, so the widget's own font
+            // size controls both atom labels and bonds, not a container box.
+            var factor = size / (11 * 4 / 3);
+            var width = result.width * factor;
+            var height = result.height * factor;
+            if (!isFinite(width) || !isFinite(height)) {
+                return veusz.error('SMILES font size produced invalid dimensions.');
+            }
+            var reply = veusz.svg(result.svg, {width: width, height: height,
                                                depth: 0});
             if (cacheSize >= 128) { cache = Object.create(null); cacheSize = 0; }
             if (cache[key] === undefined) { cacheSize++; }

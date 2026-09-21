@@ -47,6 +47,26 @@ restart.** Its settings are unavailable while disabled, so that document may
 not load correctly. This global control is separate from a feature's per-label
 switch, such as the MathJax checkbox.
 
+## Text features and standalone widgets
+
+A JavaScript feature chooses its integration with `veusz.feature(...)`:
+
+- **`target: 'text'`** adds settings to ordinary text (MathJax and KaTeX).
+- **`target: 'widget'`** registers a separate native widget, named after the
+  feature, in the Insert menu and document factory. Properties belong to the
+  widget, not to text. Its `veusz.renderWidget(...)` callback returns SVG via the
+  same deferred-loading/measurement protocol. The platform fits the SVG inside
+  a movable, resizable, rotatable box, with native save/load and undo/redo.
+  With **`sizing: 'font'`**, the widget instead has its own `size` in points and
+  natural selection bounds, not user-adjustable width/height.
+
+**[SMILES](smiles/README.md)** is a font-sized widget: choose
+**Insert -> SMILES molecule**, then enter a structure in its own SMILES property
+and choose its own **Font size** (for example `12pt`). It no longer places switches
+in labels' Text/font settings. Disabling a widget feature removes its type and
+Insert action at the next startup, so enable it before loading documents that
+use it. See the [platform API](../README.md#standalone-widgets) for declarations.
+
 ## A feature is a directory
 
 One directory per feature, with the entry point named **`feature.js`**.
