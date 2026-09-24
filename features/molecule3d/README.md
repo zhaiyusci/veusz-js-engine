@@ -1,9 +1,11 @@
-# 3D molecule widget — MolecularRenaissance, fast mode
+# 3D molecule widget — MolecularRenaissance
 
 An independent Veusz **`molecule3d`** widget backed by the author's
 [MolecularRenaissance](https://github.com/zhaiyusci/MolecularRenaissance)
-renderer. It runs offline in the existing QuickJS engine and produces SVG:
-no browser, WebGL, Node.js, service or runtime download is required.
+renderer. It produces SVG offline in the platform's **browser Worker backend**
+(default), or the explicit **QuickJS fallback**. The renderer itself needs no DOM,
+WebGL, Node.js, external service or runtime download. Keep the platform browser
+backend files alongside the plugin when using the default backend.
 
 ## Use
 
@@ -27,10 +29,12 @@ The widget uses Veusz's own Properties and Formatting docks and native tabbed
 settings controls, not a custom dialog or a single long properties list.
 
 - **Properties**: Model, XYZ coordinates and native placement/coordinate settings.
-- **Formatting -> View**: scale, atom radius scale, pitch, yaw and roll.
-- **Formatting -> Appearance**: shading, element colors, palette, texture scale
-  and element patterns.
-- **Formatting -> Lighting**: light azimuth and elevation.
+- **Formatting -> View**: render mode (default **precise**), scale, atom radius
+  scale, pitch, yaw and roll.
+- **Formatting -> Appearance**: shading, shading levels, brightness, contrast,
+  element colors, palette, texture scale and element patterns.
+- **Formatting -> Lighting**: light azimuth/elevation, cast shadows (default off)
+  and shadow strength (default 0.8). Shadows apply only in precise mode.
 - **Formatting -> Labels**: element labels, hydrogen labels, label size, font and label color.
   Disable **Hydrogen labels** to hide only H symbols while retaining H atoms and bonds;
   this switch defaults to on, matching the upstream Web UI.
@@ -39,7 +43,7 @@ Pages use the native icon tabs, with their names in tooltips and page headings.
 Native main/visibility controls remain as provided by Veusz. Changes, resets and
 multi-selection edits use the normal document operations and undo/redo.
 
-**Only presentation changed.** Saved settings retain their original flat paths:
+**Formatting pages are presentation, not storage groups.** Saved settings retain their original flat paths:
 `Set('molecule/scale', 18)`, `Set('molecule/labels', True)` and
 `Set('molecule/font', 'Arial')` remain valid. There are no new `View/scale` or
 `Labels/font` storage paths, so existing documents and scripts need no migration.
@@ -58,6 +62,13 @@ Restart Veusz after updating the plugin to rebuild the settings interface.
   saved values remain unchanged; omitted values use the current default.
 - `shading`: hatch (default), stipple, halftone, or none. `textureScale` adjusts
   mark size/spacing. `elementTextures` adds element-identifying textures.
+- `shadingLevels`: **4, 8, 16 (default), 32 or 64**, stored as a choice string
+  (for example `Set('molecule/shadingLevels', '32')`). The adapter passes a number
+  to upstream. Each is the number of positive ink levels, plus unpainted white.
+  Quantization is shared by hatch, stipple and halftone, and is inactive for `none`.
+- `shadingBrightness`: -1 to 1, default 0; positive values brighten the texture.
+  `shadingContrast`: 0.5 to 2.5, default 1.2. Both are applied by upstream after
+  directional illumination and before quantization, not reimplemented here.
 - `colored` and `palette`: element color wash, independent of shading.
 - `lightAzimuth`, `lightElevation`: direction of the parallel light, in degrees.
 - `labels`, `labelHydrogens`, `labelSize`: master label switch, H-label switch,
@@ -68,39 +79,101 @@ Restart Veusz after updating the plugin to rebuild the settings interface.
   positions, preserving label occlusion. White outlines precede colored glyphs.
 
 The canvas is transparent; atom/bond surface fills remain opaque for occlusion.
+For this pinned upstream API the adapter internally requests label-enabled owner
+layers in precise mode, even when labels are off, then strips unused text before
+Qt processing. This is needed because unlayered monochrome dots/halftone otherwise
+rely on the white page rectangle for their white atom/bond interiors. Hidden labels
+still cause no Qt glyph measurements. If certified surface fills are unavailable,
+the widget reports a nonfatal error suggesting fast mode rather than silently
+emitting hollow/transparent atoms or substituting approximate geometry.
 Qt SVG ignores `clipPath`, even in Qt 6.11. The adapter translates upstream
-clipping to white SVG masks and expands zero-length stipple segments into circle
-marks, rather than trusting parser validity. A sufficiently capable Qt SVG build
-with mask/pattern support is required; this integration is tested with Qt 6.11.
-**Native Qt/Veusz SVG export may embed rasterized mask layers or pattern tiles**,
-even though the feature returns vector SVG markup with no embedded images.
-Do not assume the final exported document is entirely vector, including hatch.
+clipping to white SVG masks. Point stipple uses upstream's shared embedded PNG
+tiles, not an independent SVG circle for every dot. The zero-length-segment to
+circle compatibility conversion remains only for upstream mark fallbacks.
+A sufficiently capable Qt SVG build with mask/pattern/image support is required;
+this integration is tested with Qt 6.11.
+**The source SVG combines vector geometry with bitmap stipple textures.** It is
+not a screenshot of the whole molecule, but it is not entirely vector either.
+Native Qt/Veusz SVG export may additionally rasterize mask layers or pattern tiles,
+including hatch. Do not equate an SVG file extension with all-vector contents.
 
 See [the Web UI comparison](WEB_UI_PARITY.md) for the verified control mapping,
 intentional default differences, and remaining fast-compatible controls not yet
 exposed by this adapter.
 
-## Fast mode is the only mode
+## Normal rendering by default; fast remains optional
 
-Every render, **including document export**, explicitly sets:
+Adapter **0.3.0** defaults `renderMode` to **`precise`**. This uses upstream's
+visible surface boundaries and occlusion rather than depth-sorted full atom
+circles. `fast` remains available in Formatting -> View for approximate overlap
+and shared templates. Both use `quality: 'export'` for preview and document export;
+mode selection is not a switch between low- and high-quality path fitting.
 
 ```js
-{renderMode: 'fast', quality: 'export', lightType: 'directional', castShadows: false}
+{
+  renderMode: props.renderMode, quality: 'export',
+  castShadows: props.renderMode === 'precise' && props.castShadows,
+  shadowStrength: props.shadowStrength,
+  quantizeShading: true, shadingLevels: Number(props.shadingLevels),
+  stippleFill: 'bitmap'
+}
 ```
 
-There is no precise-mode, point-light or cast-shadow setting. Unrecognized input
-properties cannot override these restrictions. `fast` is an upstream geometry
-mode, **not** an alias for `quality: 'preview'`; vector output is retained.
+`castShadows` starts **off**, matching the renderer API default, and can be enabled
+under Lighting. `shadowStrength` is the fraction of direct light removed by an
+occluder, from 0 to 1. Fast mode suppresses shadows without overwriting the saved
+switch or strength; switching back to precise restores their effect. Shading
+`none` also produces no shadow texture. There is no point-light option.
 
-Fast rendering uses depth-sorted complete atom circles, shared shading templates
-and sampled bond visibility. It does not compute exact sphere/sphere intersection
-boundaries or general exact bond/bond occlusion. Some overlaps can look different
-from the upstream precise renderer. This is not a photorealistic or ORTEP thermal-
-ellipsoid renderer, and sphere radii are not atomic displacement parameters.
+Existing documents that omit `renderMode` now use precise rendering. Set
+`Set('molecule/renderMode', 'fast')` to retain approximate geometry. New fields
+are flat root settings, including `molecule/castShadows` and
+`molecule/shadowStrength`; old scale, rotation and font paths remain unchanged.
+Mode and shadow values participate in the render cache.
 
-### Measured renderer cost
+Precise labels respect visibility: labels on fully occluded atoms can disappear,
+where fast-mode labels may still be emitted and overpainted. The adapter does
+not invent visible regions or force hidden labels to the front. Upstream's safe
+continuous-hatch fallback remains possible; missing certified surface fills,
+however, are rejected as described above to preserve transparent-output semantics.
 
-Current widget measurements at **18 pt/angstrom**, hatch, labels off, fresh process
+This remains an engraving renderer, not photorealistic rendering or ORTEP thermal
+ellipsoids; sphere radii are not atomic displacement parameters. Precise scenes
+can have more paths/masks and cost more in Qt painting/export even when browser
+JS generation is quick. See [precise-mode validation](PRECISE-VALIDATION.md) for
+measured scope and limitations.
+
+## Upstream synchronization: `7b93c9b` / adapter 0.2.0
+
+The five unmodified classic scripts are pinned at `7b93c9b857a63e2610abe459cca49ba0a9190773`.
+This brings shared quantized shading, reusable fast atom templates, corrected
+lighting/art ordering, and the halftone fix that paints mutually exclusive tone
+bands instead of stacking full patterns over cumulative regions.
+
+Existing documents retain their setting paths, scale, radius multiplier and label
+font semantics, but their shading can intentionally look different: this update
+uses the new quantized renderer, not a promise of old-pixel reproduction.
+
+The upstream GUI uses shared bitmap stipple tiles. Adapter **0.3.1** restores
+**`stippleFill: 'bitmap'`**, matching that design. Earlier adapters incorrectly
+forced vector marks, then expanded each mark to a circle for Qt. With C60,
+`textureScale=0.2` and shadows enabled, this bypassed the intended optimization
+and exceeded the SVG output budget. The fix reuses upstream's embedded PNG tiles;
+it does not raise the output limit or silently increase the user's texture scale.
+See [bitmap stipple validation](BITMAP-VALIDATION.md).
+
+The removed `lightType`, `lightDistance` and `lightAttenuation` options must not be
+sent even with historical directional/default values; upstream now rejects them.
+The 0.2.0 synchronization initially kept the fast-only restriction; adapter 0.3.0
+subsequently enabled precise geometry and optional directional cast shadows as
+described above. No point-light controls are reintroduced.
+
+### Historical renderer cost (before this synchronization)
+
+**All timings below describe the previous renderer, not `7b93c9b` or the browser
+backend's current performance.** They are retained only as historical context.
+
+Previous widget measurements at **18 pt/angstrom**, hatch, labels off, fresh process
 per case (including deferred JS loads, but excluding platform installation and Qt
 painting/export):
 
@@ -178,7 +251,20 @@ That authorization is not a fabricated MIT/Apache license for upstream code.
 ```text
 python features/molecule3d/tools/vendor_renderer.py --check
 python features/molecule3d/test/test_molecule3d_feature.py
+python features/molecule3d/test/test_molecule3d_formatting.py
 ```
 
-Tests use real QuickJS and Qt against the sibling `../upstream-veusz` checkout,
-without modifying host sources or user preferences.
+Tests use real Qt against the sibling `../upstream-veusz` checkout, without
+modifying host sources or saved preferences. They follow `VEUSZ_JS_ENGINE_BACKEND`
+(default browser); set it to `quickjs` to exercise the explicit fallback. Browser
+selection follows `VEUSZ_JS_ENGINE_BROWSER`. Run these suites sequentially because
+they share export fixture paths. The standalone tests require user-site PyQt;
+`python -S` is appropriate for the stdlib-only integrity checker, not these Qt tests.
+
+Regressions cover all five shading levels across all three styles, numeric
+renderer options, invalid-input recovery, cache isolation, actual Qt ink inside
+atom silhouettes, precise visibility/opaque white bodies, shadows, label geometry,
+native controls/undo, old examples and `.vsz` root-setting save/load. See
+[BITMAP-VALIDATION.md](BITMAP-VALIDATION.md) for current bitmap/dense-C60 results,
+[PRECISE-VALIDATION.md](PRECISE-VALIDATION.md) for the initial precise-mode work,
+and [UPGRADE-VALIDATION.md](UPGRADE-VALIDATION.md) for the preceding vendor upgrade.

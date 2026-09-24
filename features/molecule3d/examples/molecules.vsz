@@ -1,5 +1,5 @@
-# MolecularRenaissance, fast mode only. Enable molecule3d and restart first.
-# Independent molecule widgets and ordinary caption labels; no browser.
+# MolecularRenaissance, precise by default; fast is optional in Formatting > View.
+# Enable molecule3d and restart first. Uses the configured browser/QuickJS backend.
 Add('page', name='molecules3d', autoadd=False)
 To('molecules3d')
 Set('width', '24cm')

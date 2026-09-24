@@ -2,7 +2,13 @@
 var MolDots = (function (exports) {
     'use strict';
 
-    const LEVELS = 16;
+    /** Shared visual quantization policy, not a geometric accuracy tolerance. */
+    const TONE_LEVELS = 16;
+    function validateShadingLevels(value) {
+        if (![4, 8, 16, 32, 64].includes(value))
+            throw new Error('Invalid shadingLevels: expected 4, 8, 16, 32, or 64');
+    }
+
     const fmt$1 = (n) => String(Number(n.toFixed(4)));
     /** Disk radius / lattice pitch for a desired UNION area (not summed disk area). */
     function halftoneRadiusRatio(coverage) {
@@ -113,10 +119,10 @@ var MolDots = (function (exports) {
         }
         return paths.join('');
     }
-    /** Local numerical fallback for point lights or a BINARY shadow boundary.
+    /** Local numerical sampling for custom scalar fields or a BINARY shadow boundary.
      * It never allocates a full-frame ownership/lighting raster. Optional bisection
      * refines hard shadow edges independently of the coarse discovery grid. */
-    function sampledTonePaths(bounds, sample, step, thresholds = Array.from({ length: LEVELS }, (_, i) => (i + .5) / LEVELS), refine = false) {
+    function sampledTonePaths(bounds, sample, step, thresholds = Array.from({ length: TONE_LEVELS }, (_, i) => (i + .5) / TONE_LEVELS), refine = false) {
         const [left, top, right, bottom] = bounds;
         if (!(right > left && bottom > top))
             return thresholds.map(() => '');
@@ -157,6 +163,7 @@ var MolDots = (function (exports) {
     }
     /** Paint precomputed geometric contours with a shared aligned pattern palette. */
     function buildSurfacePatterns(o, emitSurface) {
+        const LEVELS = o.shadingLevels ?? 16;
         const [left, top, right, bottom] = o.bounds;
         if (!(right > left && bottom > top))
             return '';
@@ -167,7 +174,7 @@ var MolDots = (function (exports) {
             hash1 = Math.imul(hash1 ^ n, 16777619);
             hash2 = Math.imul(hash2, 33) ^ n;
         } };
-        hash(o.bounds.join(',') + ',' + o.pitch + o.silhouette);
+        hash(o.bounds.join(',') + ',' + o.pitch + o.silhouette + (LEVELS === 16 ? '' : ',' + LEVELS));
         function collect(layer) {
             hash(layer.clip);
             layer.tones.forEach((path, i) => { hash(path); if (path && path !== layer.tones[i + 1])
@@ -190,16 +197,39 @@ var MolDots = (function (exports) {
         function clip(id, path) { defs.push(`<clipPath id="${id}" clipPathUnits="userSpaceOnUse"><path clip-rule="evenodd" fill-rule="evenodd" d="${path}"/></clipPath>`); }
         function paint(layer, index) {
             const [left, top, right, bottom] = layer.bounds || o.bounds;
+            const frame = `M${fmt$1(left)} ${fmt$1(top)}L${fmt$1(right)} ${fmt$1(top)}L${fmt$1(right)} ${fmt$1(bottom)}L${fmt$1(left)} ${fmt$1(bottom)}Z`;
             let body = '';
             layer.tones.forEach((path, i) => {
-                if (!path || path === layer.tones[i + 1])
+                const next = layer.tones[i + 1];
+                if (!path || path === next)
                     return;
                 const id = prefix + '-tone-' + index + '-' + i;
                 clip(id, path);
-                body += `<rect data-tone-level="${i + 1}" x="${fmt$1(left)}" y="${fmt$1(top)}" width="${fmt$1(right - left)}" height="${fmt$1(bottom - top)}" fill="url(#${prefix}-${i + 1})" clip-path="url(#${id})"/>`;
+                let band = `<rect data-tone-level="${i + 1}" x="${fmt$1(left)}" y="${fmt$1(top)}" width="${fmt$1(right - left)}" height="${fmt$1(bottom - top)}" fill="url(#${prefix}-${i + 1})" clip-path="url(#${id})"/>`;
+                // Cumulative contours choose a SINGLE full-coverage screen per band.
+                // Repainting all nested disks geometrically unions to the largest disk,
+                // but source-over antialias accumulates ink as the level count increases.
+                // Intersect Pi with the complement of Pnext rather than XORing them:
+                // a numerical contour overhang must never create ink outside Pi.
+                if (next) {
+                    const inverse = id + '-next-outside';
+                    clip(inverse, frame + next);
+                    band = `<g clip-path="url(#${inverse})">${band}</g>`;
+                }
+                body += band;
             });
-            if (layer.shadow)
+            if (layer.shadow) {
+                // The binary shadow replaces the normal screen, including paper-white
+                // shadow tones. Never leave the normal pattern underneath its AA edge.
+                if (body && layer.shadow.clip) {
+                    const inverse = prefix + '-shadow-outside-' + index;
+                    clip(inverse, frame + layer.shadow.clip);
+                    body = `<g clip-path="url(#${inverse})">${body}</g>`;
+                }
+                else
+                    body = ''; // An unbounded shadow layer replaces the complete domain.
                 body += paint(layer.shadow, index + 's');
+            }
             if (body && layer.clip) {
                 const id = prefix + '-face-' + index;
                 clip(id, layer.clip);
@@ -351,6 +381,39 @@ var MolDots = (function (exports) {
         return out;
     }
 
+    /** Physical directional light and the independent artistic transfer.
+     * No environment term or secondary reflection is implied by the artistic lift.
+     */
+    /** The established post-lighting artistic brightness is B=(D+1)/2.
+     * Texture engines consume its signed encoding 2*B-1, i.e. D; the user's
+     * brightness adds to B afterwards. Contrast and quantization remain downstream.
+     */
+    function artisticLightSignal(direct, brightness = 0) {
+        return Math.max(-1, Math.min(1, direct + 2 * brightness));
+    }
+    /** Invert the artistic contrast/brightness stage into a physical direct limit.
+     * `darkness` precedes any stipple/halftone coverage-gain calibration.
+     */
+    function directLimitForDarkness(darkness, exponent, brightness) {
+        return 1 - 2 * Math.pow(darkness, 1 / exponent) - 2 * brightness;
+    }
+    /** Convert D <= limit (or D < limit) into a raw n.L threshold.
+     * The entire back hemisphere is a D=0 plateau. In particular, inclusive zero
+     * must include it, while strict zero must be empty. A fully blocked direct
+     * component is identically zero, independently of surface orientation.
+     */
+    function facingLimitForDirect(limit, transmission = 1, inclusive = true) {
+        if (inclusive ? limit < 0 : limit <= 0)
+            return -Infinity;
+        if (transmission <= 0)
+            return Infinity;
+        if (inclusive ? limit >= transmission : limit > transmission)
+            return Infinity;
+        return limit / transmission;
+    }
+
+    /** Flat, shareable serialization: no tile, no clip, one path per level. */
+    const batchPath = (b) => `<path data-stipple-radius="${b.r.toFixed(3)}"${b.level ? ` data-birth-level="${b.level}"` : ''} fill="none" stroke="#161616" stroke-width="${(2 * b.r).toFixed(3)}" stroke-linecap="round" d="${b.points.join('')}"/>`;
     const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
     function hash(x, y, salt) {
         let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(salt, 1274126177);
@@ -359,6 +422,14 @@ var MolDots = (function (exports) {
     }
     function buildDots(scene, depthAt, project, scale, illumination, options, regions = null, referenceCoverage, surfaces) {
         const o = { shadingMode: 'stipple', dotSpacing: 2.5, dotSize: .5, dotContrast: 1.2, ...options };
+        const TONE_LEVELS = o.shadingLevels === undefined ? 16 : o.shadingLevels;
+        validateShadingLevels(TONE_LEVELS);
+        if (o.quantizeShading !== undefined && typeof o.quantizeShading !== 'boolean')
+            throw new Error('Invalid quantizeShading');
+        const continuousHalftone = o.shadingMode === 'halftone' && o.quantizeShading === false;
+        // Selected-level stippling is explicit here; an omitted switch keeps the legacy
+        // continuous stream byte-identical for direct low-level callers.
+        const quantizedStipple = o.shadingMode === 'stipple' && o.quantizeShading === true;
         if (!['stipple', 'halftone'].includes(o.shadingMode))
             throw new Error('Invalid dot mode');
         if (!Number.isFinite(o.dotSpacing) || o.dotSpacing < .3 || o.dotSpacing > 19 || !Number.isFinite(o.dotSize) || o.dotSize < 0 || o.dotSize > 4 || !Number.isFinite(o.dotContrast) || o.dotContrast < .5 || o.dotContrast > 2.5)
@@ -380,7 +451,7 @@ var MolDots = (function (exports) {
         const maxX = Math.max(...shapes.map(s => s.b[2])), maxY = Math.max(...shapes.map(s => s.b[3]));
         function hit(x, y, queryRadius = maxRadius * 1.03) {
             const wx = (x - origin[0]) / scale, wy = (origin[1] - y) / scale;
-            if (regions && o.shadingMode !== 'halftone') {
+            if (regions && (o.shadingMode !== 'halftone' || continuousHalftone)) {
                 // Visibility/occlusion is already solved. The one surface intersection
                 // below only reconstructs this known owner's position for its normal.
                 const region = regions.query(x, y, queryRadius);
@@ -414,7 +485,11 @@ var MolDots = (function (exports) {
             const radial = q.map((v, i) => v - t * s.u[i]), length = Math.hypot(...radial);
             return length ? radial.map(v => v / length) : [0, 0, 1];
         }
-        const dirs = Array.from({ length: 16 }, (_, i) => [Math.cos(i * Math.PI / 8), Math.sin(i * Math.PI / 8)]);
+        // The numerical fallback needs angular resolution at exposed rod-cap corners:
+        // a corner can enter a disk between the old 16 rays even after radius padding.
+        // Certified regions bypass this sampling entirely; retain the existing safety
+        // contraction and tone calibration rather than shrinking every interior dot.
+        const dirs = !regions && (o.shadingMode === 'stipple' || continuousHalftone) ? Array.from({ length: 64 }, (_, i) => [Math.cos(i * Math.PI / 32), Math.sin(i * Math.PI / 32)]) : [];
         function safeRadius(x, y, r, owner) {
             // The whole sampled disk must stay on the same visible primitive, not
             // merely its center. Shrink at silhouettes and occlusion boundaries.
@@ -483,6 +558,63 @@ var MolDots = (function (exports) {
             const lit = clamp(lightAt(h, normal(h)), -1, 1);
             return clamp(toneGain * smoothTone(lit), 0, 1);
         }
+        if (continuousHalftone) {
+            if (toneGain === 0)
+                return '';
+            const left = o.width === undefined ? minX : Math.max(0, minX), right = o.width === undefined ? maxX : Math.min(o.width, maxX);
+            const top = o.height === undefined ? minY : Math.max(0, minY), bottom = o.height === undefined ? maxY : Math.min(o.height, maxY);
+            if (!(right > left && bottom > top))
+                return '';
+            const pitch = g * Math.SQRT2 / 5, halfDiagonal = g / 5;
+            // rotate(45) applied to ((i+.5)*pitch,(j+.5)*pitch) gives
+            // (a*g/5,b*g/5), with integer a+b odd. Enumerating screen rows
+            // avoids an enormous rotated scene box when a viewport is supplied.
+            const a0 = Math.ceil(left / halfDiagonal), a1 = Math.floor(right / halfDiagonal);
+            const b0 = Math.ceil(top / halfDiagonal), b1 = Math.floor(bottom / halfDiagonal);
+            const candidates = Math.ceil((a1 - a0 + 1) / 2) * (b1 - b0 + 1);
+            if (!Number.isSafeInteger(candidates) || candidates > 2000000)
+                throw new Error('Too many halftone marks; increase spacing or reduce output size');
+            const circles = [], owners = new Map();
+            const emitSurface = surfaces?.emitSurface;
+            for (let b = b0; b <= b1; b++)
+                for (let a = a0 + ((a0 + b) % 2 === 0 ? 1 : 0); a <= a1; a += 2) {
+                    const x = a * halfDiagonal, y = b * halfDiagonal, h = hit(x, y, halfDiagonal * 1.03);
+                    if (!h)
+                        continue;
+                    let radius = pitch * halftoneRadiusRatio(coverage(h));
+                    if (!(radius > 0))
+                        continue;
+                    const clearance = regions ? h.clearance : safeRadius(x, y, radius * 1.03, h.id);
+                    radius = Math.min(radius, Math.max(0, clearance * Math.cos(Math.PI / 16) - .003 * fineScale));
+                    // Keep complete serialized disks within the viewport as well as their
+                    // owner. Six decimals preserve continuous tone, not a 16-radius palette.
+                    if (o.width !== undefined)
+                        radius = Math.min(radius, x, o.width - x);
+                    if (o.height !== undefined)
+                        radius = Math.min(radius, y, o.height - y);
+                    radius = Math.floor(Math.max(0, radius - .000001) * 1000000) / 1000000;
+                    if (!(radius > 0))
+                        continue;
+                    const circle = `<circle cx="${x.toFixed(6)}" cy="${y.toFixed(6)}" r="${radius.toFixed(6)}"/>`;
+                    if (emitSurface) {
+                        let target = owners.get(h.id);
+                        if (!target) {
+                            target = [];
+                            owners.set(h.id, target);
+                        }
+                        target.push(circle);
+                    }
+                    else
+                        circles.push(circle);
+                }
+            const wrap = (marks) => `<g data-role="dots" data-mode="halftone" data-renderer="continuous" fill="#161616" stroke="none">${marks.join('')}</g>`;
+            if (emitSurface) {
+                for (const [id, marks] of owners)
+                    emitSurface(id, wrap(marks));
+                return '';
+            }
+            return circles.length ? wrap(circles) : '';
+        }
         if (o.shadingMode === 'halftone') {
             if (toneGain === 0)
                 return '';
@@ -491,7 +623,7 @@ var MolDots = (function (exports) {
                 o.width === undefined ? maxX : Math.min(o.width, maxX), o.height === undefined ? maxY : Math.min(o.height, maxY)
             ];
             const layers = [];
-            const thresholds = Array.from({ length: 16 }, (_, i) => (i + .5) / 16), brightness = o.shadingBrightness ?? 0;
+            const thresholds = Array.from({ length: TONE_LEVELS }, (_, i) => (i + .5) / TONE_LEVELS), brightness = o.shadingBrightness ?? 0;
             const step = o.quality === 'preview' ? 2 : 1;
             for (const { s, id, b } of shapes) {
                 if (surfaces?.paths && !surfaces.paths[id])
@@ -526,8 +658,11 @@ var MolDots = (function (exports) {
                 };
                 if (surfaces?.light && visiblePath) {
                     const light = surfaces.light;
-                    const threshold = (ink) => 1 - 2 * Math.pow(ink / toneGain, 1 / exponent) - 2 * brightness;
-                    const layer = { sourceId: id, clip: visiblePath, bounds: box, tones: thresholds.map(t => t > toneGain ? '' : directionalTonePath(s, project, light, threshold(t))) };
+                    const threshold = (ink) => directLimitForDarkness(ink / toneGain, exponent, brightness);
+                    const facingThreshold = (ink, transmission = 1) => surfaces.directLighting
+                        ? facingLimitForDirect(threshold(ink), transmission)
+                        : transmission === 1 ? threshold(ink) : (threshold(ink) + 1) / transmission - 1;
+                    const layer = { sourceId: id, clip: visiblePath, bounds: box, tones: thresholds.map(t => t > toneGain ? '' : directionalTonePath(s, project, light, facingThreshold(t))) };
                     // Only one binary shadow contour is sampled locally. Its shaded tone
                     // boundaries remain analytic, with the shadow attenuation inverted.
                     if (surfaces.shadowed && surfaces.mayShadow?.[id]) {
@@ -535,30 +670,31 @@ var MolDots = (function (exports) {
                         const mask = sampledTonePaths(box, (x, y) => { const h = onSurface(x, y); return h && shadowed(id, normal(h), h.p) ? 1 : 0; }, step, [.5], true)[0];
                         if (mask) {
                             const strength = o.shadowStrength ?? .8;
-                            const constant = clamp(toneGain * smoothTone(clamp(-1 + 2 * brightness, -1, 1)), 0, 1);
+                            const constant = clamp(toneGain * smoothTone(artisticLightSignal(surfaces.directLighting ? 0 : -1, brightness)), 0, 1);
                             layer.shadow = { sourceId: id, clip: mask, bounds: box, tones: thresholds.map(t => {
                                     if (strength >= 1)
                                         return constant >= t ? visiblePath : '';
-                                    return t > toneGain ? '' : directionalTonePath(s, project, light, (threshold(t) + 1) / (1 - strength) - 1);
+                                    return t > toneGain ? '' : directionalTonePath(s, project, light, facingThreshold(t, 1 - strength));
                                 }) };
                         }
                     }
                     layers.push(layer);
                 }
                 else {
-                    // Point-light attenuation, unsupported visibility arrangements, and
-                    // custom low-level light callbacks stay local to each primitive.
-                    layers.push({ sourceId: id, clip: visiblePath, bounds: box, tones: sampledTonePaths(box, (x, y) => { const h = onSurface(x, y); return h ? coverage(h) : null; }, step) });
+                    // Unsupported visibility arrangements and custom low-level light
+                    // callbacks stay local to each primitive.
+                    layers.push({ sourceId: id, clip: visiblePath, bounds: box, tones: sampledTonePaths(box, (x, y) => { const h = onSurface(x, y); return h ? coverage(h) : null; }, step, thresholds) });
                 }
             }
-            return buildSurfacePatterns({ bounds, pitch: g * Math.SQRT2 / 5, silhouette: projectedSilhouette(scene, project, scale), layers,
+            const renderPatterns = surfaces?.renderPatterns || buildSurfacePatterns;
+            return renderPatterns({ bounds, shadingLevels: TONE_LEVELS, pitch: g * Math.SQRT2 / 5, silhouette: projectedSilhouette(scene, project, scale), layers,
                 method: surfaces?.paths ? (surfaces.light ? (surfaces.shadowed ? 'analytic-local-shadows' : 'analytic') : 'surface-sampled') : 'local-fallback' }, surfaces?.emitSurface);
         }
         const circles = [], batches = surfaces?.compactStipple ? new Map() : null;
         const emitSurface = surfaces?.emitSurface;
         const owners = new Map();
         let markCount = 0;
-        function emit(x, y, certifiedCell = false, cellOwner = -1) {
+        function emit(x, y, certifiedCell = false, cellOwner = -1, level = 0) {
             if (x < minX || y < minY || x > maxX || y > maxY)
                 return;
             const h = certifiedCell ? null : hit(x, y);
@@ -586,12 +722,15 @@ var MolDots = (function (exports) {
                 targetBatches = target.batches;
             }
             if (targetBatches) {
-                let batch = targetBatches.get(radius);
+                // Key on the quantized radius AND the birth level: a quantized render still
+                // serializes flat round-cap paths, one per level, never a repeated tile.
+                const key = level * 10000 + Math.round(radius * 1000);
+                let batch = targetBatches.get(key);
                 if (!batch) {
-                    batch = [];
-                    targetBatches.set(radius, batch);
+                    batch = { r: radius, level, points: [] };
+                    targetBatches.set(key, batch);
                 }
-                batch.push(`M${x.toFixed(3)} ${y.toFixed(3)}h0`);
+                batch.points.push(`M${x.toFixed(3)} ${y.toFixed(3)}h0`);
             }
             else
                 targetCircles.push(`<circle cx="${x.toFixed(3)}" cy="${y.toFixed(3)}" r="${radius.toFixed(3)}"/>`);
@@ -611,9 +750,16 @@ var MolDots = (function (exports) {
                     const certifiedCell = !!regions && h.clearance >= cellRadius - 1e-12;
                     // Equal-radius Poisson marks. Account for overlap using
                     // coverage = 1-exp(-numberDensity * diskArea), rather than adding areas.
-                    const ink = Math.min(.995, coverage(h));
-                    if (ink <= 0)
+                    const rawInk = Math.min(.995, coverage(h));
+                    if (rawInk <= 0)
                         continue;
+                    // Selected-level stippling snaps local tone to the selected shared palette with
+                    // the same nearest-band rule halftone uses. Level 0 leaves paper untouched, so
+                    // quantization stays unbiased and cross-style mean coverage still agrees.
+                    const level = quantizedStipple ? Math.round(rawInk * TONE_LEVELS) : 0;
+                    if (quantizedStipple && level === 0)
+                        continue;
+                    const ink = quantizedStipple ? Math.min(.995, level / TONE_LEVELS) : rawInk;
                     const mean = -Math.log1p(-ink) * g * g / (Math.PI * o.dotSize * o.dotSize);
                     if (mean > 1000)
                         throw new Error('Stipple density too high; increase dot size');
@@ -622,7 +768,7 @@ var MolDots = (function (exports) {
                     while ((product *= 1 - hash(i, j, 100 + count)) > stop)
                         count++;
                     for (let k = 0; k < count; k++) {
-                        emit((i + hash(i, j, 10000 + 2 * k)) * g, (j + hash(i, j, 10001 + 2 * k)) * g, certifiedCell, h.id);
+                        emit((i + hash(i, j, 10000 + 2 * k)) * g, (j + hash(i, j, 10001 + 2 * k)) * g, certifiedCell, h.id, level);
                         if (markCount > 1000000)
                             throw new Error('Too many stipple marks; use a coarser texture');
                     }
@@ -633,15 +779,15 @@ var MolDots = (function (exports) {
         if (emitSurface) {
             for (const [id, target] of owners) {
                 if (target.batches)
-                    for (const [r, points] of target.batches)
-                        target.circles.push(`<path data-stipple-radius="${r.toFixed(3)}" fill="none" stroke="#161616" stroke-width="${(2 * r).toFixed(3)}" stroke-linecap="round" d="${points.join('')}"/>`);
+                    for (const batch of target.batches.values())
+                        target.circles.push(batchPath(batch));
                 emitSurface(id, `<g data-role="dots" data-mode="stipple" fill="#161616" stroke="none">${target.circles.join('')}</g>`);
             }
             return '';
         }
         if (batches)
-            for (const [r, points] of batches)
-                circles.push(`<path data-stipple-radius="${r.toFixed(3)}" fill="none" stroke="#161616" stroke-width="${(2 * r).toFixed(3)}" stroke-linecap="round" d="${points.join('')}"/>`);
+            for (const batch of batches.values())
+                circles.push(batchPath(batch));
         return `<g data-role="dots" data-mode="${o.shadingMode}" fill="#161616" stroke="none">${circles.join('')}</g>`;
     }
 

@@ -70,7 +70,7 @@ var MolDotRegions = (function (exports) {
             const p = e.p.slice(0, 2), q = e.q.slice(0, 2);
             if (p[0] === q[0] && p[1] === q[1])
                 continue;
-            edges.push({ p, q, bounds: [Math.min(p[0], q[0]), Math.min(p[1], q[1]), Math.max(p[0], q[0]), Math.max(p[1], q[1])] });
+            edges.push({ p, q, dx: q[0] - p[0], dy: q[1] - p[1], bounds: [Math.min(p[0], q[0]), Math.min(p[1], q[1]), Math.max(p[0], q[0]), Math.max(p[1], q[1])] });
         }
         const root = index(edges), regionBounds = root.bounds.slice();
         if (bounds && bounds.length >= 4 && bounds.slice(0, 4).every(Number.isFinite)) {
@@ -82,7 +82,7 @@ var MolDotRegions = (function (exports) {
                 return false;
             let inside = false, boundary = false;
             visit(root, [x, y, Infinity, y], e => {
-                const [px, py] = e.p, [qx, qy] = e.q, dx = qx - px, dy = qy - py;
+                const [px, py] = e.p, qy = e.q[1], dx = e.dx, dy = e.dy;
                 const cross = (x - px) * dy - (y - py) * dx;
                 const tolerance = 8 * EPS * (Math.abs((x - px) * dy) + Math.abs((y - py) * dx));
                 if (x >= e.bounds[0] && x <= e.bounds[2] && Math.abs(cross) <= tolerance)
@@ -110,32 +110,37 @@ var MolDotRegions = (function (exports) {
             if (!edges.length || !overlaps(root.bounds, eb))
                 return [];
             let unsafe = false;
-            function inverse(p) {
-                const x = (p[0] - c[0]) / scale, y = (p[1] - c[1]) / scale;
-                return [(vy * x - vx * y) / det, (ux * y - uy * x) / det];
-            }
             function intersect(e) {
-                const p = inverse(e.p), q = inverse(e.q), dx = q[0] - p[0], dy = q[1] - p[1], length = Math.hypot(dx, dy);
-                if (!valid(p) || !valid(q) || !(length > 0) || Math.max(Math.hypot(...p), Math.hypot(...q)) > 1e8) {
+                const x = (e.p[0] - c[0]) / scale, y = (e.p[1] - c[1]) / scale;
+                const px = (vy * x - vx * y) / det, py = (ux * y - uy * x) / det;
+                const qx = (e.q[0] - c[0]) / scale, qy = (e.q[1] - c[1]) / scale;
+                const qpx = (vy * qx - vx * qy) / det, qpy = (ux * qy - uy * qx) / det;
+                const dx = qpx - px, dy = qpy - py, length = Math.hypot(dx, dy);
+                if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(qpx) || !Number.isFinite(qpy) || !(length > 0)) {
+                    unsafe = true;
+                    return;
+                }
+                const norm = Math.hypot(px, py);
+                if (Math.max(norm, Math.hypot(qpx, qpy)) > 1e8) {
                     unsafe = true;
                     return;
                 }
                 const ex = dx / length, ey = dy / length;
                 // Unit-speed segment in the inverse ellipse frame meets the unit circle.
                 // D = 1 - cross(p,e)^2 avoids cancellation of b*b - a*c.
-                const b = p[0] * ex + p[1] * ey, h = p[0] * ey - p[1] * ex;
+                const b = px * ex + py * ey, h = px * ey - py * ex;
                 let d = (1 - Math.abs(h)) * (1 + Math.abs(h));
                 if (d < -32 * EPS * Math.max(1, h * h))
                     return;
                 d = Math.max(0, d);
-                const r = Math.sqrt(d), stable = -b - (b < 0 ? -r : r), norm = Math.hypot(p[0], p[1]);
+                const r = Math.sqrt(d), stable = -b - (b < 0 ? -r : r);
                 const roots = stable === 0 ? [-b] : [stable, (norm - 1) * (norm + 1) / stable];
                 for (const s of roots) {
                     const t = s / length;
                     if (t < -32 * EPS || t > 1 + 32 * EPS)
                         continue;
                     const f = Math.max(0, Math.min(1, t));
-                    let angle = Math.atan2(p[1] + f * dy, p[0] + f * dx) / TAU;
+                    let angle = Math.atan2(py + f * dy, px + f * dx) / TAU;
                     if (angle < 0)
                         angle += 1;
                     cuts.push(angle);
@@ -235,7 +240,7 @@ var MolDotRegions = (function (exports) {
                 if (!overlaps(root.bounds, lb))
                     return [];
                 visit(root, lb, e => {
-                    const ex = e.q[0] - e.p[0], ey = e.q[1] - e.p[1], px = e.p[0] - a[0], py = e.p[1] - a[1];
+                    const ex = e.dx, ey = e.dy, px = e.p[0] - a[0], py = e.p[1] - a[1];
                     const det = dx * ey - dy * ex;
                     if (det !== 0) {
                         const t = (px * ey - py * ex) / det, s = (px * dy - py * dx) / det;
@@ -267,8 +272,8 @@ var MolDotRegions = (function (exports) {
     }
     function insideBox(b, x, y) { return x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]; }
     function distance2(e, x, y) {
-        var dx = e.q[0] - e.p[0], dy = e.q[1] - e.p[1];
-        var t = Math.max(0, Math.min(1, ((x - e.p[0]) * dx + (y - e.p[1]) * dy) / (dx * dx + dy * dy)));
+        var dx = e.dx, dy = e.dy;
+        var t = Math.max(0, Math.min(1, ((x - e.p[0]) * dx + (y - e.p[1]) * dy) / e.length2));
         var a = x - e.p[0] - t * dx, b = y - e.p[1] - t * dy;
         return a * a + b * b;
     }
@@ -365,7 +370,8 @@ var MolDotRegions = (function (exports) {
                 if (next[0] === prev[0] && next[1] === prev[1])
                     return null;
                 var eb = [Math.min(prev[0], next[0]), Math.min(prev[1], next[1]), Math.max(prev[0], next[0]), Math.max(prev[1], next[1])];
-                var edge = { p: prev, q: next, bounds: eb };
+                var dx = next[0] - prev[0], dy = next[1] - prev[1];
+                var edge = { p: prev, q: next, dx: dx, dy: dy, length2: dx * dx + dy * dy, bounds: eb };
                 poly.push(edge);
                 edges.push(edge);
                 include(bounds, prev);
@@ -462,7 +468,7 @@ var MolDotRegions = (function (exports) {
             var list = o.rows[row] || [], yes = false;
             for (var i = 0; i < list.length; i++) {
                 var p = list[i].p, q = list[i].q;
-                if ((p[1] > y) !== (q[1] > y) && x < p[0] + (y - p[1]) * (q[0] - p[0]) / (q[1] - p[1]))
+                if ((p[1] > y) !== (q[1] > y) && x < p[0] + (y - p[1]) * list[i].dx / list[i].dy)
                     yes = !yes;
             }
             return yes;

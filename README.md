@@ -65,7 +65,7 @@ Shipped features: **[MathJax](features/mathjax/README.md)**,
 **[KaTeX](features/katex/README.md)**,
 **[SMILES molecule widget](features/smiles/README.md)**, and
 **[3D molecule widget](features/molecule3d/README.md)** (MolecularRenaissance,
-fast mode only). For SMILES, select a page
+precise rendering by default, optional fast mode and directional shadows). For SMILES, select a page
 or graph, choose **Insert → SMILES molecule**, and enter a molecule such as `CCO`
 in its own **SMILES** property. Set its own **Font size** to size the structure,
 and move or rotate it using the selection controls. Its selection box follows

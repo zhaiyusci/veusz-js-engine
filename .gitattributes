@@ -16,6 +16,12 @@ features/mathjax/fonts/*.js binary
 features/katex/katex.min.js binary
 features/smiles/smiles-drawer.js binary
 features/smiles/LICENSE-SMILESDRAWER.txt text eol=lf
+# Pinned raw MolecularRenaissance bytes: vendor_renderer.py checks SHA256.
+features/molecule3d/dot-regions.js binary
+features/molecule3d/boundaries.js binary
+features/molecule3d/wash.js binary
+features/molecule3d/dots.js binary
+features/molecule3d/renderer.js binary
 
 # Everything else we wrote is text and should diff.  Deliberately not `*.js`:
 # this repository exists to make features easy to write, `jsapi.js` is the API

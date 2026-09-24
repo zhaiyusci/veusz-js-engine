@@ -6,14 +6,15 @@
 (function () {
     'use strict';
     veusz.feature({name: 'molecule3d', title: '3D molecule', target: 'widget',
-                   source: 'model', sizing: 'natural', version: '0.1.0',
+                   source: 'model', sizing: 'natural', version: '0.3.1',
                    formattingPages: [
                        {name: 'View', title: 'View', icon: 'button_scene3d',
-                        settings: ['scale', 'atomRadiusScale', 'pitch', 'yaw', 'roll']},
+                        settings: ['renderMode', 'scale', 'atomRadiusScale', 'pitch', 'yaw', 'roll']},
                        {name: 'Appearance', title: 'Appearance', icon: 'settings_bgfill',
-                        settings: ['shading', 'colored', 'palette', 'textureScale', 'elementTextures']},
+                        settings: ['shading', 'shadingLevels', 'shadingBrightness', 'shadingContrast',
+                                    'colored', 'palette', 'textureScale', 'elementTextures']},
                        {name: 'Lighting', title: 'Lighting', icon: 'settings_lighting',
-                        settings: ['lightAzimuth', 'lightElevation']},
+                        settings: ['lightAzimuth', 'lightElevation', 'castShadows', 'shadowStrength']},
                        {name: 'Labels', title: 'Labels', icon: 'settings_axislabel',
                         settings: ['labels', 'labelHydrogens', 'labelSize', 'font', 'color']}
                    ]});
@@ -31,6 +32,9 @@
              'Idealized example, or embedded XYZ coordinates in angstrom.', ['water', 'ethanol', 'c60', 'xyz']);
     property('text', 'xyz', '', 'XYZ coordinates',
              'Single-frame XYZ, up to 96 atoms. Bonds are inferred from distances, not chemical valence.', null, 1);
+    property('choice', 'renderMode', 'precise', 'Render mode',
+             'Precise computes visible surface boundaries; fast uses approximate painter-ordered overlap.',
+             ['precise', 'fast']);
     property('number', 'scale', 18, 'Scale (pt/angstrom)',
              'Physical projection scale, 1 to 100 points per angstrom; no automatic fitting.');
     property('number', 'atomRadiusScale', 0.75, 'Atom radius scale',
@@ -40,6 +44,13 @@
     property('number', 'roll', 0, 'Roll (degrees)', 'Fixed Z-axis rotation after pitch and yaw.');
     property('choice', 'shading', 'hatch', 'Shading', 'Molecular engraving style.',
              ['hatch', 'stipple', 'halftone', 'none']);
+    property('choice', 'shadingLevels', '16', 'Shading levels',
+             'Positive ink levels plus unpainted white; shared by all shading styles. Inactive for none.',
+             ['4', '8', '16', '32', '64']);
+    property('number', 'shadingBrightness', 0, 'Shading brightness',
+             'Brightness offset after directional lighting, -1 to 1; positive is brighter.');
+    property('number', 'shadingContrast', 1.2, 'Shading contrast',
+             'Shared shading contrast, 0.5 to 2.5; applied before tone quantization.');
     property('switch', 'colored', true, 'Element colors', 'Fill atom surfaces with element colors.');
     property('choice', 'palette', 'jmol', 'Palette', 'Element color palette.',
              ['jmol', 'rasmol', 'pymol', 'ortep']);
@@ -51,6 +62,10 @@
     property('number', 'labelSize', 12, 'Label size (pt)', 'Independent label size, 6 to 72 points.');
     property('number', 'lightAzimuth', -29, 'Light azimuth (degrees)', 'Camera-fixed directional light azimuth.');
     property('number', 'lightElevation', 32, 'Light elevation (degrees)', 'Camera-fixed directional light elevation.');
+    property('switch', 'castShadows', false, 'Cast shadows',
+             'Cast directional shadows in precise mode; ignored in fast mode without changing this setting.');
+    property('number', 'shadowStrength', 0.8, 'Shadow strength',
+             'Fraction of direct light removed by an occluder, 0 to 1; only used with precise cast shadows.');
 
     var bundles = [['MolDotRegions', 'dot-regions.js'], ['MolBoundaries', 'boundaries.js'],
                    ['MolWash', 'wash.js'], ['MolDots', 'dots.js'], ['MolEngraver', 'renderer.js']];
@@ -138,8 +153,13 @@
             var circles = d.replace(pattern, function (_, x, y) {
                 return '<circle cx="' + x + '" cy="' + y + '" r="' + radius + '"/>';
             });
-            return '<g data-stipple-radius="' + attrs['data-stipple-radius'] + '" fill="'
-                + (attrs.stroke || '#161616') + '" stroke="none">' + circles + '</g>';
+            // Keep template transforms, tone metadata, opacity and masks on the
+            // replacement group, rather than losing the path's inherited context.
+            var preserved = Object.keys(attrs).filter(function (name) {
+                return !/^(d|fill|stroke|stroke-width|stroke-linecap|stroke-linejoin)$/.test(name);
+            }).map(function (name) { return ' ' + name + '="' + attrs[name] + '"'; }).join('');
+            return '<g' + preserved + ' fill="' + (attrs.stroke || '#161616')
+                + '" stroke="none">' + circles + '</g>';
         });
     }
     veusz.renderWidget(function (req) {
@@ -154,7 +174,10 @@
             if (p.model === 'xyz' && !p.xyz.trim()) { return null; }
             if (p.xyz.length > 65536) { throw new Error('XYZ input is limited to 65536 characters.'); }
             choice(p, 'shading', ['hatch', 'stipple', 'halftone', 'none']);
+            choice(p, 'shadingLevels', ['4', '8', '16', '32', '64']);
             choice(p, 'palette', ['jmol', 'rasmol', 'pymol', 'ortep']);
+            choice(p, 'renderMode', ['precise', 'fast']);
+            bounded(p, 'shadowStrength', 0, 1);
             bounded(p, 'scale', 1, 100);
             bounded(p, 'atomRadiusScale', 0.1, 3);
             bounded(p, 'textureScale', 0.2, 2.5);
@@ -162,7 +185,7 @@
             ['pitch', 'yaw', 'roll', 'lightAzimuth', 'lightElevation'].forEach(function (name) {
                 bounded(p, name, -36000, 36000);
             });
-            ['colored', 'elementTextures', 'labels', 'labelHydrogens'].forEach(function (name) {
+            ['colored', 'elementTextures', 'labels', 'labelHydrogens', 'castShadows'].forEach(function (name) {
                 if (typeof p[name] !== 'boolean') { throw new Error(name + ' must be true or false.'); }
             });
             var color = /^#[0-9a-f]{6}$/i.test(req.color || '') ? req.color : '#000000';
@@ -239,11 +262,25 @@
             var canvasW = Math.max(200, Math.ceil(width)), canvasH = Math.max(200, Math.ceil(height));
             var options = {
                 width: canvasW, height: canvasH, scale: svgScale, atomRadiusScale: p.atomRadiusScale,
-                orientation: q, quality: 'export', renderMode: 'fast', lightType: 'directional', castShadows: false,
+                orientation: q, quality: 'export', renderMode: p.renderMode,
+                // Preserve the saved shadow settings while fast mode suppresses them.
+                castShadows: p.renderMode === 'precise' && p.castShadows,
+                shadowStrength: p.shadowStrength,
+                quantizeShading: true, shadingLevels: Number(p.shadingLevels),
+                // Match upstream's shared bitmap tiles; do not expand dense stipple
+                // textures into hundreds of thousands of independent vector dots.
+                stippleFill: 'bitmap',
+                shadingBrightness: bounded(p, 'shadingBrightness', -1, 1),
+                shadingContrast: bounded(p, 'shadingContrast', 0.5, 2.5),
                 lightAzimuth: p.lightAzimuth * rad, lightElevation: p.lightElevation * rad,
                 shadingMode: p.shading === 'none' ? 'hatch' : p.shading,
                 textureScale: p.textureScale, elementTextures: p.elementTextures,
-                colorWash: p.colored, colorScheme: p.palette, labels: p.labels,
+                colorWash: p.colored, colorScheme: p.palette,
+                // In this pinned upstream revision labels request certified owner
+                // layers (opaque white atoms/bonds as well as colored surfaces).
+                // Without them, non-hatch styles rely on the white page rectangle,
+                // which this transparent Veusz widget removes. Strip unused text below.
+                labels: p.renderMode === 'precise' || p.labels,
                 labelSize: labelSize, labelColor: color, labelFont: 'sans-serif',
                 labelBold: false, labelItalic: false, labelHydrogens: p.labelHydrogens,
                 labelStrokeColor: '#ffffff', labelStrokeWidth: 4, labelMatchFill: false
@@ -251,6 +288,10 @@
             if (p.shading === 'none') { options.shadingSize = 0; }
             var svg = engine.render(molecule, options);
             if (typeof svg !== 'string' || !/^<svg\b/.test(svg)) { throw new Error('Renderer returned invalid SVG.'); }
+            if (p.renderMode === 'precise' && !/\bdata-role="surface-fill"/.test(svg)) {
+                throw new Error('Precise visible surfaces could not be certified for transparent output; try fast render mode.');
+            }
+            if (!p.labels) { svg = svg.replace(/<text\b[^>]*>[\s\S]*?<\/text>/g, ''); }
             // Only the exact upstream canvas rectangle is removed. White atom
             // and bond surfaces are necessary for occlusion and remain intact.
             svg = svg.replace('<rect width="100%" height="100%" fill="white"/>', '');

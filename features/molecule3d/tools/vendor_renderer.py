@@ -10,16 +10,16 @@ from pathlib import Path
 import urllib.request
 
 REPOSITORY = 'https://github.com/zhaiyusci/MolecularRenaissance'
-COMMIT = 'b351c7b22085ab9c107e4f526c86fc673d3702a6'
+COMMIT = '7b93c9b857a63e2610abe459cca49ba0a9190773'
 VERSION = '0.2.0'
 RAW_BASE = 'https://raw.githubusercontent.com/zhaiyusci/MolecularRenaissance/' + COMMIT
 # In dependency load order. Hashes are over raw bytes, not normalized text.
 ARTIFACTS = (
-    ('dot-regions.js', 27097, '641597db1605395112e223f8837948d3e5683f7641b545c0f6d0985d440bf647'),
-    ('boundaries.js', 39769, '4cb52442ab94dcf56962dc89c7aa13b7dc63f802fd8d873caf3e08cd75f9a74f'),
+    ('dot-regions.js', 27436, '31194c110bbf515fe899559c629cb8db4f56c4b4528acb390c4b493f01d771a1'),
+    ('boundaries.js', 53328, 'dad09e51b6add3abd714aaa127107f2fca310640300b3eeb7aeb98de166d37d6'),
     ('wash.js', 28091, 'af954e4c449475b6587741d44302c72c744296f4d5405e2406b2d851eaa05751'),
-    ('dots.js', 36547, '528939c79a007d24e53497f2af0d43852a1a6f0d60163b3440c648805cc15241'),
-    ('renderer.js', 181441, '339d294c87367656cd9ed70299768db6ee6a1609fcaf1d82cc1f4410304c2fa4'),
+    ('dots.js', 45776, '87c023035c954e7fd2cd82785ee40dfe83e212cdda9a25ce881fdf9924a56981'),
+    ('renderer.js', 1321176, '4319934870a1f2645944d6600bf561fd5fff660271cb6b2a02b98210cb1262ba'),
 )
 DESTINATION = Path(__file__).resolve().parents[1]
 

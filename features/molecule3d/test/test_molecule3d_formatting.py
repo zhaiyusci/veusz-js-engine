@@ -20,9 +20,10 @@ qt, engine, veusz, APP = base.qt, base.engine, base.veusz, base.APP
 from veusz.windows import treeeditwindow as tree
 
 PAGES = {
-    'View': ['scale', 'atomRadiusScale', 'pitch', 'yaw', 'roll'],
-    'Appearance': ['shading', 'colored', 'palette', 'textureScale', 'elementTextures'],
-    'Lighting': ['lightAzimuth', 'lightElevation'],
+    'View': ['renderMode', 'scale', 'atomRadiusScale', 'pitch', 'yaw', 'roll'],
+    'Appearance': ['shading', 'shadingLevels', 'shadingBrightness', 'shadingContrast',
+                   'colored', 'palette', 'textureScale', 'elementTextures'],
+    'Lighting': ['lightAzimuth', 'lightElevation', 'castShadows', 'shadowStrength'],
     'Labels': ['labels', 'labelHydrogens', 'labelSize', 'font', 'color'],
 }
 FORMATTED = {name for members in PAGES.values() for name in members}
@@ -139,6 +140,91 @@ class FormattingTests(unittest.TestCase):
         self.doc.undoOperation()
         self.assertEqual(self.settings.scale, 30)
 
+    def test_native_mode_shadow_edit_undo_reset_and_fast_saved_state(self):
+        tabs = self.tabs(self.proxy())
+        view = self.plist(tabs, 'View')
+        lighting = self.plist(tabs, 'Lighting')
+        mode = view.setncntrls['renderMode'][1]
+        self.assertIsInstance(mode, qt.QComboBox)
+        self.assertEqual([mode.itemText(i) for i in range(mode.count())], ['precise', 'fast'])
+        self.assertEqual(self.settings.renderMode, 'precise')
+
+        def edit(page, name, value):
+            setting = self.settings.get(name)
+            controller = page.setncntrls[name][1]
+            controller.sigSettingChanged.emit(controller, setting, value)
+            self.assertEqual(self.doc.resolveSettingPath(None, self.widget.path + '/' + name).get(), value)
+
+        edit(lighting, 'castShadows', True)
+        self.doc.undoOperation()
+        self.assertFalse(self.settings.castShadows)
+        self.doc.redoOperation()
+        edit(lighting, 'shadowStrength', .6)
+        self.doc.undoOperation()
+        self.assertEqual(self.settings.shadowStrength, .8)
+        self.doc.redoOperation()
+        edit(view, 'renderMode', 'fast')
+        self.assertTrue(self.settings.castShadows)
+        self.assertEqual(self.settings.shadowStrength, .6)
+        # Controls stay editable in fast, but their stored state is not effective.
+        edit(lighting, 'shadowStrength', .35)
+        fast, _ = self.render(self.feature.read(self.settings))
+        self.assertNotIn('error', fast)
+        edit(lighting, 'castShadows', False)
+        fast_off, _ = self.render(self.feature.read(self.settings))
+        self.assertEqual(fast['svg'], fast_off['svg'])
+        self.doc.undoOperation()
+        self.assertTrue(self.settings.castShadows)
+        edit(view, 'renderMode', 'precise')
+        self.assertTrue(self.settings.castShadows)
+        self.assertEqual(self.settings.shadowStrength, .35)
+        precise, _ = self.render(self.feature.read(self.settings))
+        self.assertNotIn('error', precise)
+        self.assertNotEqual(precise['svg'], fast['svg'])
+        self.doc.undoOperation()
+        self.assertEqual(self.settings.renderMode, 'fast')
+        self.assertTrue(self.settings.castShadows)
+        self.assertEqual(self.settings.shadowStrength, .35)
+        self.doc.redoOperation()
+        self.assertEqual(self.render(self.feature.read(self.settings))[0], precise)
+        for page, name, default in [(view, 'renderMode', 'precise'),
+                                    (lighting, 'castShadows', False),
+                                    (lighting, 'shadowStrength', .8)]:
+            before = self.settings.get(name).get()
+            page._setnsproxy.resetToDefault(name)
+            self.assertEqual(self.settings.get(name).get(), default)
+            if before != default:
+                self.doc.undoOperation()
+                self.assertEqual(self.settings.get(name).get(), before)
+
+    def test_appearance_shading_controls_edit_undo_reset_at_root(self):
+        tabs = self.tabs(self.proxy())
+        plist = self.plist(tabs, 'Appearance')
+        for name, default, changed in [('shadingLevels', '16', '64'),
+                                       ('shadingBrightness', 0, -.5),
+                                       ('shadingContrast', 1.2, 2.25)]:
+            with self.subTest(name=name):
+                setting = self.settings.get(name)
+                control = plist.setncntrls[name][1]
+                self.assertEqual(setting.get(), default)
+                if name == 'shadingLevels':
+                    self.assertIsInstance(control, qt.QComboBox)
+                    self.assertEqual([control.itemText(i) for i in range(control.count())],
+                                     ['4', '8', '16', '32', '64'])
+                control.sigSettingChanged.emit(control, setting, changed)
+                self.assertEqual(setting.get(), changed)
+                self.assertEqual(self.doc.resolveSettingPath(
+                    None, self.widget.path + '/' + name).get(), changed)
+                self.doc.undoOperation()
+                self.assertEqual(setting.get(), default)
+                self.doc.redoOperation()
+                self.assertEqual(setting.get(), changed)
+                plist._setnsproxy.resetToDefault(name)
+                self.assertEqual(setting.get(), default)
+                self.doc.undoOperation()
+                self.assertEqual(setting.get(), changed)
+                plist._setnsproxy.resetToDefault(name)
+
     def test_hydrogen_label_control_and_radius_default_reset(self):
         tabs = self.tabs(self.proxy())
         labels = self.plist(tabs, 'Labels')
@@ -215,21 +301,35 @@ class FormattingTests(unittest.TestCase):
         self.settings.yaw = 41
         self.settings.labels = True
         self.settings.font = 'Times New Roman'
+        self.settings.shadingLevels = '8'
+        self.settings.shadingBrightness = .3
+        self.settings.shadingContrast = .75
         path = OUT / 'formatting-flat-roundtrip.vsz'
         self.doc.save(str(path))
         text = path.read_text(encoding='utf-8')
         for name in PAGES:
             self.assertNotIn(name + '/', text)
         self.assertIn("Set('scale', 27", text)
+        # This is a legacy-style flat document: no new settings are serialized.
+        for name in ('renderMode', 'castShadows', 'shadowStrength'):
+            self.assertNotIn("Set('%s'," % name, text)
         doc = veusz.document.Document()
         interface = veusz.document.CommandInterface
         with patch.object(interface, 'safe_commands', [n for n in interface.safe_commands if hasattr(interface, n)]):
             doc.load(str(path))
         loaded = doc.resolveWidgetPath(None, self.widget.path)
+        self.assertEqual(loaded.settings.renderMode, 'precise')
+        self.assertFalse(loaded.settings.castShadows)
+        self.assertEqual(loaded.settings.shadowStrength, .8)
         self.assertEqual(loaded.settings.scale, 27)
         self.assertEqual(loaded.settings.yaw, 41)
         self.assertTrue(loaded.settings.labels)
         self.assertEqual(loaded.settings.font, 'Times New Roman')
+        for name, value in [('shadingLevels', '8'), ('shadingBrightness', .3),
+                            ('shadingContrast', .75)]:
+            self.assertEqual(getattr(loaded.settings, name), value)
+            self.assertIs(loaded.settings.get(name).parent, loaded.settings)
+            self.assertIn("Set('%s'," % name, text)
         self.assertFalse(set(PAGES) & set(loaded.settings.getNames()))
 
     def test_generic_page_uses_declared_storage_name_not_handle(self):
@@ -348,7 +448,7 @@ veusz.renderWidget(function(req){return veusz.svg('<svg xmlns="http://www.w3.org
             build = base.PROJECT / 'build'
             build.mkdir(exist_ok=True)
             screenshots = []
-            for name in ('View', 'Labels', 'Appearance'):
+            for name in ('View', 'Labels', 'Appearance', 'Lighting'):
                 plist = self.plist(tabs, name)
                 APP.processEvents()
                 APP.processEvents()
@@ -365,7 +465,7 @@ veusz.renderWidget(function(req){return veusz.svg('<svg xmlns="http://www.w3.org
                 output = build / ('molecule3d-formatting-' + name.lower() + '.png')
                 self.assertTrue(image.save(str(output)))
                 screenshots.append(hashlib.sha256(output.read_bytes()).hexdigest())
-            self.assertEqual(len(set(screenshots)), 3, 'formatting page screenshots must differ')
+            self.assertEqual(len(set(screenshots)), 4, 'formatting page screenshots must differ')
 
 
 if __name__ == '__main__':
