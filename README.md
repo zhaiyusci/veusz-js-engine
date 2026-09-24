@@ -3,14 +3,17 @@
 A JavaScript engine for Veusz, as a plugin — **the abstract half** of a
 two-layer design: this platform, and the features it runs.
 
-There is one JavaScript engine here, and it is **QuickJS**. This plugin owns
-exactly one binary, and it is that engine — plus the plumbing a Veusz plugin
-needs to put JavaScript behind part of Veusz. It knows nothing about formulas,
-fonts, LaTeX or text rendering, and it ships no JavaScript of its own.
+The **experimental default backend is now a system browser**, with **QuickJS
+available as an explicit fallback**. The platform supplies the plumbing a Veusz
+plugin needs to run JavaScript; it knows nothing about formulas, fonts or LaTeX.
+Its JavaScript is host/API infrastructure, while rendering libraries belong to
+features. Browser mode needs Firefox, Edge or Chrome, not `qjs.dll`; that binary
+is retained for QuickJS mode. **Restart Veusz after upgrading or changing the
+backend/configuration.** See [浏览器后端部署与限制](BROWSER-BACKEND.md).
 
 ```
 veusz-js-engine (this plugin)                      the platform
-    the engine: QuickJS, driven from the platform itself
+    the backend: system browser (experimental default), or explicit QuickJS
     a JavaScript API a feature is written against
     Veusz plumbing, written once for every feature:
         the properties panel, from what the feature declares
@@ -36,13 +39,13 @@ declares into Veusz settings and what it returns into a drawing. A feature
 (`feature.py`), and then it uses the plumbing directly — that is the escape
 hatch, not the way in.
 
-There is **one binary**, and it is the engine. The platform talks to
-QuickJS's C API itself — there is no compiled bridge of our own, and no C in
-this project at all. (There used to be one: a shim that wrapped the same API
-for Python. It was removed after this binding was measured to reproduce its
-output byte for byte, which meant it had been pure overhead.) A feature may
-still ship a different build of the engine beside its JavaScript — the search
-starts there — but it needs nothing else.
+Browser mode uses a dedicated system-browser process/profile and one Worker per
+feature runtime, behind a local HTTP bridge hosted by Veusz's own Python threads.
+It needs no separately installed Python or server, and does not use CDP or touch
+the user's browser profile. Qt measurement, deferred loading and drawing keep
+the existing synchronous feature protocol. QuickJS mode instead uses the retained
+`qjs.dll` through the platform's direct C API binding; there is no compiled bridge
+of our own. A browser failure never silently switches to QuickJS.
 
 ---
 
@@ -59,8 +62,10 @@ the next startup. The manager remains available even when all features are off.
 With no features enabled, there are no feature-specific settings rows.
 
 Shipped features: **[MathJax](features/mathjax/README.md)**,
-**[KaTeX](features/katex/README.md)**, and
-**[SMILES molecule widget](features/smiles/README.md)**. For SMILES, select a page
+**[KaTeX](features/katex/README.md)**,
+**[SMILES molecule widget](features/smiles/README.md)**, and
+**[3D molecule widget](features/molecule3d/README.md)** (MolecularRenaissance,
+fast mode only). For SMILES, select a page
 or graph, choose **Insert → SMILES molecule**, and enter a molecule such as `CCO`
 in its own **SMILES** property. Set its own **Font size** to size the structure,
 and move or rotate it using the selection controls. Its selection box follows
@@ -70,7 +75,13 @@ not add anything to ordinary Text/font settings.
 ```
 veusz-js-engine/               this repository: the platform
   veusz_js_engine.py           the one plugin Veusz is told about
-  qjs.dll                      the engine: QuickJS (MIT) — the platform's
+  browser_backend.py           browser bridge; keep beside the plugin
+  browser_host/                required browser host assets
+    index.html
+    page.js
+    worker.js
+  BROWSER-BACKEND.md            browser deployment and operational limits
+  qjs.dll                      QuickJS (MIT), retained for explicit fallback
   jsapi.js                     the API a feature is written against
   features/                    features: dropped in, auto-loaded
     README.md
@@ -155,7 +166,28 @@ loaded.
 
 ---
 
-## The engine, and why there is anything between it and us
+## The engine backends
+
+`VEUSZ_JS_ENGINE_BACKEND=browser` is the experimental default; `quickjs` selects
+explicit fallback. One browser session hosts multiple isolated Workers, one per
+feature runtime. Its bridge binds only `127.0.0.1` on a random port, checks a
+session token, Host and Origin, and accepts one client. Calls remain synchronous
+and serialized across features: startup and timeout waits can block the Veusz UI.
+RPC timeout defaults to 30 seconds; startup has a separate 60-second deadline.
+
+Browser features are **trusted JavaScript, not a security sandbox**. Worker
+network/nested-worker globals are disabled and its CSP uses `connect-src 'none'`;
+the backend's captured loader still loads scripts. `run` uses indirect eval, so
+top-level `let`/`const` do not persist; `run_file` loads a classic script and keeps
+those declarations. `call` returns a synchronous string, without awaiting Promises.
+See [the deployment guide](BROWSER-BACKEND.md) for configuration and failure handling.
+
+### QuickJS fallback: why there is anything between it and us
+
+The following binding details apply only to explicit QuickJS mode. Its retained
+binary is accessed directly, without a compiled shim. The former shim was removed
+after the Python binding reproduced its output byte for byte. A feature can still
+carry a compatible QuickJS build beside its JavaScript, where the search starts.
 
 QuickJS's own idea of its job is simple: hand it some JavaScript and it hands
 something back. What it hands back is a **handle into its own heap**, and a
@@ -200,10 +232,10 @@ this is not three lines:
   runtime is created *and* called there: the budget is a constant, and which of
   Veusz's threads asked stops mattering.
 
-That binding is 200 lines of a 2100-line file. The rest is Veusz: the settings
-a feature declares, the properties panel, the draw seam, working out where the
-box goes, and the feature protocol. It is in the same file only because Veusz
-loads one plugin file — the engine part is small, and it is at the top.
+That binding remains in `veusz_js_engine.py`. The rest of the platform handles
+Veusz: the settings a feature declares, the properties panel, the draw seam,
+working out where the box goes, and the feature protocol. The browser bridge is
+in the accompanying `browser_backend.py`; Veusz still registers only one plugin.
 
 ---
 
@@ -272,6 +304,34 @@ The selection box follows the returned dimensions; moving and rotating are
 supported, but resizing the box cannot override the font size. Page dimensions
 do not change the drawing's physical size. See
 [the SMILES feature](features/smiles/feature.js) for a complete font-sized example.
+
+**`sizing: 'natural'`** also uses returned point dimensions and move/rotate-only
+selection controls, but adds no native `size`, `width` or `height` setting.
+`req.size` remains 12; a feature defines its own meaningful scale, such as the
+3D molecule widget's points per angstrom and independent atom-label size. The
+host never auto-fits these drawings to a page or box.
+
+### Native Formatting pages for widgets
+
+A widget can organize existing settings into native Formatting pages without
+renaming or moving their storage paths:
+
+```js
+veusz.feature({name: 'diagram', target: 'widget', formattingPages: [
+    {name: 'Appearance', title: 'Appearance', icon: 'settings_bgfill',
+     settings: ['diagramColor', 'font']}
+]});
+veusz.text('ink', {setting: 'diagramColor', default: '#000000'});
+```
+
+`settings` lists **Veusz storage names**, not JavaScript property handles; it can
+include widget-native settings such as `font` and `color`. Listed settings become
+formatting settings and appear in that page, not in Properties or duplicated on
+Main. Other settings keep their usual classification. The platform uses native
+`SettingsProxy` views and `TabbedFormatting`, so the original settings, paths,
+values, document operations, reset and undo/redo remain unchanged. Matching
+multi-selected widgets use the same pages; mixed declarations fall back to the
+ordinary native layout. These are UI pages, not serialized Settings subgroups.
 
 ### A property has two names, and the feature declares both
 
@@ -594,35 +654,36 @@ follow, and all of them matter:
   needs under Veusz, which passes empty globals — finds Veusz's *outer* loader
   instead, which names whatever Veusz was told to load, not the feature.
 
-Both binaries are *searched for* rather than assumed, so a feature that has to
-carry its own can, and a user who keeps them elsewhere can say so. The search
-starts beside the JavaScript, then beside this plugin, then one directory up
-from each — which makes the normal case, nothing to configure, come out of the
-layout:
+Keep `browser_backend.py`, `browser_host/`, `jsapi.js` and `features/` with the
+plugin as shown in the installation tree. Browser discovery prefers Firefox,
+then Edge, then Chrome; it searches installed locations and PATH unless an
+explicit executable is configured. No browser binary is bundled or required
+for explicit QuickJS mode.
 
-```
-plugins/
-  veusz-js-engine/   veusz_js_engine.py  jsapi.js  qjs.dll
-  features/
-    a-feature/       feature.js  a.js
-    b-feature/       feature.js  b.js  fonts.json
-```
+In **QuickJS fallback only**, the binary search starts beside the JavaScript,
+then beside this plugin, then one directory up from each. A feature's own
+compatible `qjs.dll` therefore wins over the platform's unless overridden.
 
-A feature's own directory is searched **first**, so a feature that ships a
-particular build of either binary gets it, and every other feature finds the
-platform's.
+### Environment variables
 
-These environment variables win over the search: `VEUSZ_JS_ENGINE_QUICKJS` (the
-engine), `VEUSZ_JS_ENGINE_FEATURES` (more feature directories), and
-`VEUSZ_JS_ENGINE_DEFER=1` (do not install on load, which the tests use). An environment variable naming a file that is **not
-there** is an error rather than a silent fallback, because a typo in one is
-otherwise invisible.
+Set these in the environment of the process that launches Veusz, then **fully
+restart Veusz**; changing them does not replace an already active backend.
 
-> The older, released `veusz-mathjax-plugin` has its own set of names —
-> `VEUSZ_JSENGINES_*` — from the days when it called what it loaded *engines*.
-> The two sets are separate on purpose: this platform has exactly one engine
-> and everything else is a feature, so it does not inherit a name that says
-> otherwise, and nothing here depends on the old plugin being installed.
+| variable | meaning / default |
+|---|---|
+| `VEUSZ_JS_ENGINE_BACKEND` | `browser` (experimental default), or explicit `quickjs` |
+| `VEUSZ_JS_ENGINE_BROWSER` | Optional browser executable path; otherwise Firefox → Edge → Chrome discovery |
+| `VEUSZ_JS_ENGINE_BROWSER_MODE` | `headless` (default) or `visible` for diagnosis |
+| `VEUSZ_JS_ENGINE_BROWSER_TIMEOUT` | RPC timeout in seconds, default `30`; must be finite and positive. Startup separately allows 60 seconds |
+| `VEUSZ_JS_ENGINE_QUICKJS` | Explicit QuickJS library path, used only by QuickJS fallback |
+| `VEUSZ_JS_ENGINE_FEATURES` | Additional feature directories |
+| `VEUSZ_JS_ENGINE_DEFER=1` | Do not install on load (used by tests) |
+
+An explicit executable/library path that does not exist is an error, not a silent
+search fallback. See [PowerShell launch examples](BROWSER-BACKEND.md#powershell-启动示例).
+
+> The older, released `veusz-mathjax-plugin` uses `VEUSZ_JSENGINES_*`.
+> Those names remain separate: this platform does not depend on the old plugin.
 
 ---
 
@@ -653,12 +714,24 @@ extend this:
   (Measured a name at a time: `render` alone loads; `renderInline` alone does
   not. An earlier note here said `renderInline` because the experiment that
   found it changed two names at once.)
-* **QuickJS has no filesystem, network or `console` here.** The platform
+* **Browser mode is experimental and synchronous.** There is no automatic
+  reconnect or QuickJS downgrade. A failed browser session requires restarting
+  Veusz; `Platform.close_all()` permanently disposes that platform, and hot reload
+  is unsupported. Startup/timeout waits block the calling UI; features run serially.
+  Workers disable `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `Worker`,
+  `SharedWorker` and the public `importScripts` global, while a captured backend
+  loader keeps script loading working. These restrictions are not a security
+  sandbox: load trusted features only.
+* **Browser cleanup is best effort.** Windows can kill the process tree while the
+  main browser PID is alive; a parent crashing first can leave orphan processes.
+  Cleanup failures appear in the session report and retain the temporary directory
+  for diagnosis. Neither normal shutdown nor crashes guarantee absolute cleanup.
+* **QuickJS fallback has no filesystem, network or `console` here.** The platform
   creates a bare runtime and injects only an `Object.hasOwn` polyfill, so a
   third-party JavaScript file cannot touch anything outside its own
   computation. There is a 256 MB memory cap. What is **not** covered is a
   timeout or an interrupt handler, so a file with an infinite loop hangs Veusz.
-* **The JS engine runs on a thread of the platform's own.** QuickJS does not
+* **QuickJS fallback runs on a thread of the platform's own.** QuickJS does not
   look up the stack it has: it compares the current C stack pointer against a
   top and a budget the host gives it, so *whoever calls* decides what the
   engine may do. Veusz's paint threads are not ours to size and are not all the
@@ -689,7 +762,7 @@ extend this:
   created inside is recorded, and it all goes back in reverse on the way out,
   including when the scope raises. A test asserts that no scope is ever left
   open, after good calls and after fifty failing ones.
-* **The engine's C ABI is not guessable from its header.** `JSValue` is 16
+* **QuickJS fallback's C ABI is not guessable from its header.** `JSValue` is 16
   bytes here (a tagged union) because the build is not `JS_NAN_BOXING`, and
   that choice is a macro at *build* time; a returned string can be a rope
   (`JS_TAG_STRING_ROPE`, -6) rather than a string (-7); the predicates
@@ -721,9 +794,9 @@ extend this:
   the box it occupies in points, which is the one shape that can look the same
   in the window and in an export. MathML or a raster would each need a second
   route into Veusz's renderer for no drawing this platform needs.
-* Nothing stops a feature's JavaScript that never returns. There is no timeout,
-  no interrupt and no thread to kill: a `while(1)` in `feature.js` hangs Veusz.
-  QuickJS has the hook for it (`JS_SetInterruptHandler`), so this is one more
-  binding rather than a design problem — but until it is bound, a broken
-  feature is a frozen window.
-* Binaries are Windows x64 only.
+* In **QuickJS fallback**, nothing stops JavaScript that never returns: there is
+  no timeout or interrupt, so a `while(1)` in `feature.js` hangs Veusz. QuickJS has
+  the hook (`JS_SetInterruptHandler`), but it is not bound. Browser mode instead
+  has an RPC timeout that fails the session; this is not automatic recovery.
+* The bundled QuickJS binary is Windows x64 only. Browser discovery includes
+  other platforms, but this is not a claim of validated cross-platform deployment.

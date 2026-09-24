@@ -45,10 +45,23 @@
      * Widget `sizing: 'font'` supplies a widget-local point-size setting, passes
      * it as req.size, and uses returned dimensions in points as natural size
      * instead of fitting to an adjustable width/height box.
+     * Widget `sizing: 'natural'` uses returned point dimensions too, but adds
+     * no size/width/height settings; req.size stays 12 and the feature declares
+     * its own scale properties. Both modes use move/rotate-only controls.
      *
      *   veusz.feature({name: 'diagram', title: 'Diagram', target: 'widget',
      *                  source: 'input'});
      *   veusz.text('input', {default: ''});
+     *
+     * Widget `formattingPages` organizes existing settings into Veusz's native
+     * Formatting tabs without changing their saved paths:
+     *   formattingPages: [{name: 'Labels', title: 'Atom labels',
+     *     icon: 'settings_axislabel', settings: ['labels', 'font', 'color']}]
+     * `settings` contains STORAGE names (the property's setting, not its JS
+     * handle), including native settings. Members become formatting settings;
+     * unlisted settings keep their classification. Pages are UI-only views,
+     * not saved subgroups: Set('font', ...) still addresses the root setting.
+     * Native single/multi-selection controls, resets and undo remain in use.
      */
     veusz.feature = function (declared) {
         Object.keys(declared || {}).forEach(function (key) {
@@ -109,6 +122,13 @@
      *
      * A property on its own may also be declared `hidden: true`, which keeps
      * it out of the panel entirely while leaving it in the document.
+     * `formatting: true` classifies it as a native Formatting setting rather
+     * than a Properties setting; false keeps the usual Properties behavior.
+     * A widget formattingPages membership also marks it as formatting.
+     * Widget properties may set `posn` to an integer insertion index in the
+     * root settings list (negative means append). Without it, source comes
+     * first and other properties append. Formatting page order is determined
+     * by each page's settings list, independently of this root ordering.
      */
     veusz.switch = function (name, options) { return declare('switch', name, options); };
     veusz.choice = function (name, options) { return declare('choice', name, options); };
@@ -131,6 +151,8 @@
      * width/height describe the drawing's natural aspect ratio. With widget
      * sizing:'font', width/height are the natural physical dimensions in points,
      * calculated by the feature from req.size; the host does not fit them.
+     * sizing:'natural' likewise returns point dimensions without fitting, but
+     * the feature calculates them using its own declared scale properties.
      */
     veusz.renderText = function (fn) { painter = fn; return veusz; };
     veusz.renderWidget = function (fn) { painter = fn; return veusz; };
@@ -218,8 +240,10 @@
      *   face      what font the text element is set in, as a string that
      *             changes whenever that font would be painted differently.
      *             A drawing that contains text of its own depends on it.
-     *   measured  the answer to a reply that asked for text to be shaped --
-     *             see below.
+     *   measured  keyed answers to requested text runs: w (advance), h and d
+     *             are in em; ink:{x,y,w,h} is the signed visible-ink box in em.
+     *             path coordinates alone use 1000 units/em. Use ink to center
+     *             a glyph, but w to lay out consecutive text runs.
      *   discard   the host could not do what the feature asked (the font has
      *             no outlines): forget the half-built drawing and draw without
      *             your own text rather than draw nothing.

@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veusz browser JS engine experiment</title>
+<style>body{font:16px system-ui;max-width:850px;margin:60px auto;padding:20px;background:#fafafa;color:#222}h1{font-size:26px}#status{padding:18px;background:#e7eef8;white-space:pre-wrap}img{display:block;max-width:100%;margin:35px 0}small{color:#555}</style>
+<h1>Browser as a local JS engine</h1>
+<p>This isolated experiment executes the existing MathJax feature in a browser Worker. Python sends requests over local HTTP and receives SVG strings.</p>
+<p id="status">Connecting…</p>
+<img id="preview" alt="Latest SVG returned to Python">
+<small>Keep this page open. No Veusz plugin files are modified. This prototype does not implement reconnection or Qt text shaping.</small>
+<script src="/page.js"></script>
+</html>

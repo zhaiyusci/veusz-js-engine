@@ -93,7 +93,7 @@ class SmilesFeatureTests(unittest.TestCase):
         factory.regwidgets.pop('smiles', None)
         self.feature = engine.install_js_feature(self.platform, FEATURE / 'feature.js', FEATURE, 'smiles')
         self.runtime = self.feature.runtime
-        self.addCleanup(self.runtime.close)
+        self.addCleanup(self.platform.close_all)
         self.doc = veusz.document.Document()
         self.commands = veusz.document.CommandInterface(self.doc)
         self.page = self.commands.Add('page')

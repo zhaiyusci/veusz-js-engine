@@ -14,6 +14,7 @@ licences and notices, including the licences of any bundled dependencies:
 | `features/katex/katex.min.js` | KaTeX 0.18.7, unmodified | **MIT** — text in `features/katex/LICENSE-KATEX.txt` |
 | `features/smiles/smiles-drawer.js` | SmilesDrawer 2.4.1, unmodified npm bundle; includes chroma-js 2.4.2 | **MIT**, **BSD-3-Clause**, and **Apache-2.0** ColorBrewer data; notices in `features/smiles/LICENSE-*.txt` and the bundle |
 | `features/smiles/headless.js`, `features/smiles/feature.js` | SMILES adapter and feature | **Apache-2.0** (this project) |
+| `features/molecule3d/{dot-regions,boundaries,wash,dots,renderer}.js` | MolecularRenaissance / molplotter 0.2.0, pinned unmodified | Upstream license unspecified; integrated with project author's authorization. See `features/molecule3d/UPSTREAM.md`; not relicensed as Apache-2.0. |
 | `features/*/feature.js` | a feature, written against this platform | whatever its author says |
 | esbuild | build tool | MIT, used to build the MathJax bundle; not redistributed |
 

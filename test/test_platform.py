@@ -95,17 +95,19 @@ class PlatformTests(unittest.TestCase):
         cls.beta = cls.js_dir / 'beta.js'
         cls.beta.write_text(make('beta'), encoding='utf-8')
 
-        cls.platform = platform_module.Platform(here)
+        # These tests inspect QuickJS handles/stack budgeting explicitly.
+        cls.platform = platform_module.Platform(here, backend='quickjs')
 
     @classmethod
     def tearDownClass(cls):
         import shutil
+        cls.platform.close_all()
         shutil.rmtree(cls.js_dir, ignore_errors=True)
 
     def test_a_runtime_is_made_from_a_path(self):
         # a platform of its own: the shared one has been used by other tests,
         # and its runtimes are already up
-        fresh = platform_module.Platform(PROJECT)
+        fresh = platform_module.Platform(PROJECT, backend='quickjs')
         runtime = fresh.runtime(self.alpha)
         self.assertEqual(runtime.path, self.alpha)
         
@@ -594,8 +596,11 @@ class VeuszTests(unittest.TestCase):
     def test_installs_and_publishes_itself(self):
         published = getattr(veusz.utils, 'js_engine', None)
         self.assertIsNotNone(published, 'the platform was not published')
-        self.assertEqual(published.quickjs is not None, True,
-                         'the QuickJS engine was not found next to the plugin')
+        self.assertIn(published.backend, ('browser', 'quickjs'))
+        if published.backend == 'quickjs':
+            self.assertIsNotNone(published.quickjs, 'the QuickJS fallback DLL is missing')
+        else:
+            self.assertIsNone(published.quickjs, 'browser mode must not depend on a DLL')
         # the shipped feature loaded, and it brought its own JavaScript
         self.assertIn('mathjax', published.feature_names())
         self.assertTrue(published.runtimes(),

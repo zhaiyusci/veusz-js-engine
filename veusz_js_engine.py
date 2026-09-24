@@ -4,13 +4,14 @@ Part of the veusz-js-engine project.  Licensed under the Apache License 2.0.
 
 WHAT THIS IS, AND WHAT IT IS NOT
 --------------------------------
-There is one JavaScript engine here, and it is QuickJS.  This plugin carries
-it, and everything a Veusz plugin needs to put JavaScript behind part of Veusz.
+The experimental default executes JavaScript in an installed browser via a
+loopback HTTP service. QuickJS remains an explicitly selected fallback. This
+plugin carries the plumbing needed to put JavaScript behind part of Veusz.
 It knows nothing about formulas, fonts, LaTeX or text rendering, and it ships
 no JavaScript of its own -- except the API a feature is written against.
 
     veusz-js-engine (this plugin)          the platform
-        |  engine: QuickJS, driven from here
+        |  engine: system browser by default; optional QuickJS
         |  a JavaScript API that a feature is written against
         |  Veusz plumbing, written once for every feature:
         |    the properties panel the feature declares
@@ -68,6 +69,7 @@ cannot arise.  See README.md.
 import contextlib
 import ctypes
 import html
+import importlib.util
 import json
 import os
 import queue
@@ -77,7 +79,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 # A QuickJS runtime is not safe to call from two threads at once.  Every call
 # runs on the platform's engine thread (:class:`_EngineThread`), so this lock is
@@ -86,8 +88,8 @@ __version__ = '0.3.0'
 # would deadlock against the engine thread taking this one.
 _LOCK = threading.RLock()
 
-#: Guards a ``Runtime``'s own lifecycle (starting and closing), on whatever
-#: thread asked -- never held while the engine works.
+#: Serializes Runtime lifecycle and calls. Browser HTTP completion runs on
+#: independent threads and must never acquire this lock or depend on Qt events.
 _RUNTIME_LOCK = threading.RLock()
 
 # where a consumer looks for the platform once it is installed
@@ -655,15 +657,53 @@ class _QuickJS(object):
 
 
 
+# Capture this while Veusz's exec loader frame still exists (there is no
+# __file__ in a plugin namespace). Later rendering may run on another thread.
+_BACKEND_DIRECTORY = _plugin_dir()
+
+
+def select_backend(backend=None, engine=None):
+    """Browser by default; an explicit DLL retains the legacy Runtime API."""
+    chosen = backend if backend is not None else os.environ.get(
+        'VEUSZ_JS_ENGINE_BACKEND', 'quickjs' if engine is not None else 'browser')
+    chosen = str(chosen).strip().lower()
+    if chosen not in ('browser', 'quickjs'):
+        raise JsEngineError('VEUSZ_JS_ENGINE_BACKEND must be browser or quickjs, got %r'
+                            % chosen)
+    return chosen
+
+
+def _new_browser_session():
+    """Load the bundled pure-Python backend without changing sys.path."""
+    if _BACKEND_DIRECTORY is None:
+        raise JsEngineError('cannot locate browser_backend.py beside the plugin')
+    path = _BACKEND_DIRECTORY / 'browser_backend.py'
+    name = '_veusz_js_browser_backend'
+    module = sys.modules.get(name)
+    if module is None or Path(getattr(module, '__file__', '')).resolve() != path.resolve():
+        if not path.is_file():
+            raise JsEngineError('missing browser backend: %s' % path)
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            sys.modules.pop(name, None)
+            raise JsEngineError('cannot load browser backend: %s' % exc) from exc
+    return module.BrowserSession(error_type=JsEngineError)
+
+
 class Runtime(object):
-    """A QuickJS runtime holding one JavaScript file.
+    """A selected JavaScript backend holding one JavaScript file.
 
     Start is lazy: the runtime, the parse and the memory that goes with them
     are only paid when the file is first called, so a JavaScript file a
     feature carries but never needs costs nothing.
     """
 
-    def __init__(self, path, engine=None, label=None):
+    def __init__(self, path, engine=None, label=None, backend=None,
+                 browser_session=None):
         self.path = Path(path)
         #: what to call this runtime in a message.  A JavaScript feature's
         #: runtime is created with the platform's API file and then has the
@@ -672,6 +712,10 @@ class Runtime(object):
         self.label = Path(label) if label else Path(path)
         #: the engine to load; the platform works it out and passes it
         self.engine = Path(engine) if engine else None
+        self.backend = select_backend(backend, engine)
+        self._browser_session = browser_session
+        self._owns_browser_session = browser_session is None
+        self._closing = threading.Event()
         self._js = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -686,16 +730,31 @@ class Runtime(object):
         return self
 
     def _start_locked(self):
+        if self._closing.is_set():
+            raise JsEngineError('runtime is closing')
         if self.started:
             return self
-        if self.engine is None:
-            raise JsEngineError(
-                'no QuickJS engine for %s. Put one beside it (%s), or set '
-                'VEUSZ_JS_ENGINE_QUICKJS.'
-                % (self.path.name, ' / '.join(_QUICKJS_NAMES[:2])))
+        if getattr(self, '_closed_feature', False):
+            raise JsEngineError('feature runtime was closed; restart Veusz')
         if not self.path.is_file():
             raise JsEngineError('no such JavaScript file: %s' % self.path)
-        js = _QuickJS(self.engine, self.label)
+        if self.backend == 'quickjs':
+            if self.engine is None:
+                raise JsEngineError(
+                    'no QuickJS engine for %s. Put one beside it (%s), or set '
+                    'VEUSZ_JS_ENGINE_QUICKJS.'
+                    % (self.path.name, ' / '.join(_QUICKJS_NAMES[:2])))
+            js = _QuickJS(self.engine, self.label)
+        else:
+            if self._browser_session is None:
+                self._browser_session = _new_browser_session()
+            session = self._browser_session
+            # close() may have observed None before this session was assigned.
+            if self._closing.is_set():
+                if self._owns_browser_session:
+                    session.close()
+                raise JsEngineError('runtime is closing')
+            js = session.create_runtime(str(self.label))
         try:
             js.run_file(self.path)
             # A bundle has always been expected to define render(); the probe
@@ -705,15 +764,35 @@ class Runtime(object):
                                     % self.path.name)
         except Exception:
             js.close()
+            if self.backend == 'browser' and self._owns_browser_session:
+                session.close()
+                if self._browser_session is session:
+                    self._browser_session = None
             raise
         self._js = js
         return self
 
     def close(self):
+        # Mark intent BEFORE looking at the session. A concurrently starting
+        # runtime either sees it or publishes a session that we can interrupt.
+        self._closing.set()
+        session = self._browser_session
+        if self.backend == 'browser' and self._owns_browser_session and session is not None:
+            session.close()
         with _RUNTIME_LOCK:
-            if self._js is not None:
-                self._js.close()
-            self._js = None
+            try:
+                if self.backend == 'browser' and self._owns_browser_session:
+                    current = self._browser_session
+                    if current is not None and current is not session:
+                        current.close()
+                    self._browser_session = None
+                if self._js is not None:
+                    self._js.close()
+            finally:
+                self._js = None
+                if hasattr(self, 'feature_entry'):
+                    self._closed_feature = True
+                self._closing.clear()
 
     # -- the primitive -----------------------------------------------------
 
@@ -773,21 +852,26 @@ class Runtime(object):
 # --------------------------------------------------------------------------
 
 class Platform(object):
-    """A QuickJS host, and the Veusz plumbing a feature builds on.
+    """A browser/QuickJS host, and the Veusz plumbing a feature builds on.
 
     A feature reaches this through ``veusz.utils.js_engine`` (or
     :func:`get_platform`); see the module docstring for why it is published
     rather than imported.
 
-    The platform owns one binary -- the engine (QuickJS) -- and drives it
-    itself.  It owns the Veusz side too: a feature declares what it wants and
+    The default backend owns a local HTTP session and an isolated installed
+    browser process; the optional QuickJS backend uses qjs.dll. A feature declares what it wants and
     returns an SVG, and everything between those two facts is here.
     """
 
-    def __init__(self, here, state=None):
+    def __init__(self, here, state=None, backend=None):
         self.here = Path(here) if here else None
-        #: the engine, next to the platform itself -- the platform's own file
-        self.quickjs = find_quickjs(self.here)
+        self.backend = select_backend(backend)
+        # The experimental browser path has no dependency on a QuickJS DLL,
+        # including a stale/invalid VEUSZ_JS_ENGINE_QUICKJS setting.
+        self.quickjs = find_quickjs(self.here) if self.backend == 'quickjs' else None
+        self._browser_session = None
+        self._closed = threading.Event()
+        self._browser_last_report = None
         self._runtimes = {}
         self._features = []
         # Frozen on first feature discovery: preference edits need a restart.
@@ -797,7 +881,28 @@ class Platform(object):
 
     # -- using a JavaScript file ------------------------------------------
 
+    def _check_open(self):
+        if self._closed.is_set():
+            raise JsEngineError('platform is closed; create a new Platform or restart Veusz')
+
+    def _browser(self):
+        if self.backend != 'browser':
+            return None
+        with _RUNTIME_LOCK:
+            self._check_open()
+            if self._browser_session is None:
+                self._browser_session = _new_browser_session()
+            if self._closed.is_set():
+                self._browser_session.close()
+                self._check_open()
+            return self._browser_session
+
     def runtime(self, path):
+        with _RUNTIME_LOCK:
+            self._check_open()
+            return self._runtime_locked(path)
+
+    def _runtime_locked(self, path):
         """A runtime for the JavaScript file at *path*, started on first use.
 
         One runtime per file: ask twice and the same one comes back, so a
@@ -812,11 +917,13 @@ class Platform(object):
             raise JsEngineError('no such JavaScript file: %s' % path)
         # the platform's own file, but a feature may ship its own copy, so
         # the feature's directory is looked at first
-        quickjs = find_quickjs(path.parent, self.here)
+        quickjs = (find_quickjs(path.parent, self.here)
+                   if self.backend == 'quickjs' else None)
         key = ('file', path)
         runtime = self._runtimes.get(key)
         if runtime is None:
-            runtime = Runtime(path, engine=quickjs)
+            runtime = Runtime(path, engine=quickjs, backend=self.backend,
+                              browser_session=self._browser())
             self._runtimes[key] = runtime
         return runtime
 
@@ -847,6 +954,11 @@ class Platform(object):
         return cls
 
     def feature_runtime(self, entry, feature_dir=None):
+        with _RUNTIME_LOCK:
+            self._check_open()
+            return self._feature_runtime_locked(entry, feature_dir)
+
+    def _feature_runtime_locked(self, entry, feature_dir=None):
         """A runtime for one JavaScript feature, loaded and ready to ask.
 
         The order is: the platform's API, then every other ``*.js`` of the
@@ -862,19 +974,30 @@ class Platform(object):
         entry = Path(entry).resolve()
         if not entry.is_file():
             raise JsEngineError('no such JavaScript file: %s' % entry)
-        quickjs = find_quickjs(entry.parent, self.here)
+        quickjs = (find_quickjs(entry.parent, self.here)
+                   if self.backend == 'quickjs' else None)
 
         key = ('feature', entry)
         runtime = self._runtimes.get(key)
-        if runtime is None:
+        if runtime is None or getattr(runtime, '_closed_feature', False):
             api = self.js_api()
             runtime = Runtime(api if api is not None else entry,
-                              engine=quickjs, label=entry)
+                              engine=quickjs, label=entry, backend=self.backend,
+                              browser_session=self._browser())
             runtime.feature_entry = entry
             runtime.loaded_scripts = set()
             runtime.deferred_bundles = _deferred_bundles(entry, feature_dir)
             self._runtimes[key] = runtime
 
+        try:
+            return self._load_feature_scripts(runtime, entry, feature_dir)
+        except Exception:
+            # Do not retain a partly evaluated global lexical environment.
+            self._runtimes.pop(key, None)
+            runtime.close()
+            raise
+
+    def _load_feature_scripts(self, runtime, entry, feature_dir):
         api = self.js_api()
         heads = feature_js_heads(feature_dir)
         if heads and 'veuszFileHeads' not in runtime.loaded_scripts:
@@ -911,13 +1034,35 @@ class Platform(object):
         return self
 
     def close_all(self):
-        for runtime in self._runtimes.values():
-            runtime.close()
-        self._runtimes.clear()
+        """Permanently dispose this platform; restart rather than reuse contexts."""
+        self._closed.set()
+        # Wake blocked RPCs BEFORE acquiring the lock held by their callers.
+        session = self._browser_session
+        if session is not None:
+            session.close()
+        with _RUNTIME_LOCK:
+            current = self._browser_session
+            if current is not None:
+                if current is not session:
+                    current.close()
+                self._browser_last_report = current.report()
+                for error in self._browser_last_report.get('cleanup_errors', []):
+                    self.state.note('browser cleanup: %s' % error)
+            self._browser_session = None
+            for runtime in list(self._runtimes.values()):
+                try:
+                    runtime.close()
+                except Exception as exc:
+                    self.state.note('runtime cleanup: %s' % exc)
+            self._runtimes.clear()
 
     def report(self):
         return {
-            'engine': str(self.quickjs) if self.quickjs else None,
+            'backend': self.backend,
+            'engine': ('system browser (experimental)' if self.backend == 'browser'
+                       else str(self.quickjs) if self.quickjs else None),
+            'browser': (self._browser_session.report()
+                        if self._browser_session is not None else self._browser_last_report),
             'runtimes': [
                 {'path': str(path), 'kind': kind,
                  'size': path.stat().st_size if path.exists() else 0,
@@ -2054,6 +2199,11 @@ def measure_text_runs(qt, requests, label_font):
                 'w': advance / _OUTLINE_PX,
                 'h': max(0.0, -box.top()) / _OUTLINE_PX,
                 'd': max(0.0, box.bottom()) / _OUTLINE_PX,
+                # Signed ink bounds in em, distinct from the layout advance.
+                'ink': {'x': box.left() / _OUTLINE_PX,
+                        'y': box.top() / _OUTLINE_PX,
+                        'w': box.width() / _OUTLINE_PX,
+                        'h': box.height() / _OUTLINE_PX},
                 'path': _svg_path_data(qt, path) if not path.isEmpty() else '',
             }
             if len(_TEXT_RUNS) >= 512:
@@ -2405,6 +2555,10 @@ def _property_setting(setting, kind, name, spec):
     descr = spec.get('descr') or ''
     default = spec.get('default')
     args = {'usertext': label}
+    if 'formatting' in spec:
+        if not isinstance(spec['formatting'], bool):
+            raise JsEngineError('property formatting must be true or false')
+        args['formatting'] = spec['formatting']
     if descr:
         args['descr'] = descr
     if spec.get('hidden'):
@@ -2845,6 +2999,137 @@ def _install_widget_insert_actions():
                 add_actions(editor)
 
 
+def _widget_formatting_pages(settings, declaration):
+    """Validate presentation pages without changing any setting's storage path."""
+    from veusz import setting
+
+    if not isinstance(declaration, list):
+        raise JsEngineError('formattingPages must be a list')
+    pages, names, members = [], set(), set()
+    for page in declaration:
+        if not isinstance(page, dict):
+            raise JsEngineError('formatting page must be an object')
+        name = page.get('name')
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', name):
+            raise JsEngineError('invalid formatting page name %r' % name)
+        if name in names or name in settings.getNames():
+            raise JsEngineError('duplicate or conflicting formatting page %r' % name)
+        title, icon = page.get('title', name), page.get('icon', 'settings_main')
+        if not isinstance(title, str) or not title.strip():
+            raise JsEngineError('formatting page title must be nonempty text')
+        if not isinstance(icon, str) or not icon.strip():
+            raise JsEngineError('formatting page icon must be nonempty text')
+        fields = page.get('settings')
+        if not isinstance(fields, list) or not fields:
+            raise JsEngineError('formatting page settings must be a nonempty list')
+        for field in fields:
+            if not isinstance(field, str) or field not in settings:
+                raise JsEngineError('unknown formatting page setting %r' % field)
+            if not isinstance(settings.get(field), setting.Setting):
+                raise JsEngineError('formatting pages contain settings, not groups')
+            if field in members:
+                raise JsEngineError('duplicate formatting page setting %r' % field)
+            members.add(field)
+        names.add(name)
+        pages.append({'name': name, 'title': title, 'icon': icon,
+                      'settings': tuple(fields)})
+    # Validation finishes before changing any flags.
+    for field in members:
+        settings.get(field).formatting = True
+    settings.__dict__['_js_formatting_pages'] = tuple(pages)
+
+
+def _install_widget_formatting_pages():
+    """Project flat settings into Veusz's own lazy Formatting tabs.
+
+    Only the UI proxies change: native Setting objects retain their owners,
+    signals, references, document paths, serialization and undo operations.
+    """
+    from veusz.windows import treeeditwindow as tree
+
+    if getattr(tree, '_js_engine_formatting_pages_hooked', False):
+        return
+
+    def pages_for(proxy):
+        roots = (getattr(proxy, '_settingsatlevel', None)
+                 if isinstance(proxy, tree.SettingsProxyMulti)
+                 else [proxy.settings])
+        if not roots:
+            return ()
+        pages = roots[0].__dict__.get('_js_formatting_pages', ())
+        # Mixed widget selections retain Veusz's ordinary common-setting view.
+        if any(s.__dict__.get('_js_formatting_pages', ()) != pages for s in roots[1:]):
+            return ()
+        return pages
+
+    class FormattingPageProxy(tree.SettingsProxy):
+        def __init__(self, owner, page):
+            self.owner, self.page = owner, page
+            self.document = owner.document
+
+        @property
+        def name(self):
+            return self.page['name']
+
+        def pixmap(self):
+            return self.page['icon']
+
+        def usertext(self):
+            return self.page['title']
+
+        def setnsmode(self):
+            return 'formatting'
+
+        def settingList(self):
+            root = (self.owner._settingsatlevel[0]
+                    if isinstance(self.owner, tree.SettingsProxyMulti)
+                    else self.owner.settings)
+            return [root.get(name) for name in self.page['settings']]
+
+        def childProxyList(self):
+            return self.settingList()
+
+        def settingsProxyList(self):
+            return []
+
+        def actionsList(self):
+            return []
+
+        def onSettingChanged(self, control, setting, value):
+            return self.owner.onSettingChanged(control, setting, value)
+
+        def onSettingChangedIteratively(self, control, setting, values):
+            return self.owner.onSettingChangedIteratively(control, setting, values)
+
+        def multivalued(self, name):
+            return self.owner.multivalued(name)
+
+        def resetToDefault(self, name):
+            return self.owner.resetToDefault(name)
+
+    def filtered(original):
+        def get_list(proxy):
+            pages = pages_for(proxy)
+            result = original(proxy)
+            if not pages:
+                return result
+            members = {field for page in pages for field in page['settings']}
+            return [item for item in result if item.name not in members]
+        return get_list
+
+    def grouped(original):
+        def get_groups(proxy):
+            return list(original(proxy)) + [FormattingPageProxy(proxy, page)
+                                            for page in pages_for(proxy)]
+        return get_groups
+
+    for cls in (tree.SettingsProxySingle, tree.SettingsProxyMulti):
+        cls.settingList = filtered(cls.settingList)
+        cls.childProxyList = filtered(cls.childProxyList)
+        cls.settingsProxyList = grouped(cls.settingsProxyList)
+    tree._js_engine_formatting_pages_hooked = True
+
+
 def install_js_widget(platform, feature, declared):
     """Register a user-creatable native box for a JS widget declaration."""
     from veusz import document, setting
@@ -2853,7 +3138,7 @@ def install_js_widget(platform, feature, declared):
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', feature.name):
         raise JsEngineError('invalid widget type name %r' % feature.name)
     sizing = getattr(feature, 'sizing', 'box')
-    if sizing not in ('box', 'font'):
+    if sizing not in ('box', 'font', 'natural'):
         raise JsEngineError('unknown widget sizing %r' % sizing)
     entry = str(Path(feature.entry).resolve())
     existing = document.thefactory.regwidgets.get(feature.name)
@@ -2873,13 +3158,14 @@ def install_js_widget(platform, feature, declared):
             @classmethod
             def addSettings(cls, s):
                 BoxShape.addSettings(s)
-                if sizing == 'font':
+                if sizing in ('font', 'natural'):
                     s.remove('width')
                     s.remove('height')
-                    s.add(setting.DistancePt(
-                        'size', '12pt', usertext='Font size',
-                        descr='Font size controlling the whole drawing',
-                        formatting=False), posn=0)
+                    if sizing == 'font':
+                        s.add(setting.DistancePt(
+                            'size', '12pt', usertext='Font size',
+                            descr='Font size controlling the whole drawing',
+                            formatting=False), posn=0)
                 else:
                     s.get('width').newDefault([0.2])
                     s.get('height').newDefault([0.2])
@@ -2892,20 +3178,23 @@ def install_js_widget(platform, feature, declared):
                 s.add(setting.Color('color', 'black', usertext='Color',
                                     formatting=True))
                 for member, prop in declared:
-                    s.add(member.copy(), posn=0 if prop['name'] == feature.source
-                          else -1)
+                    posn = prop.get('posn', 0 if prop['name'] == feature.source else -1)
+                    if type(posn) is not int:
+                        raise JsEngineError('widget property posn must be an integer')
+                    s.add(member.copy(), posn=posn)
+                _widget_formatting_pages(s, getattr(feature, 'formatting_pages', []))
 
             def drawShape(self, painter, rect):
                 _draw_js_widget(platform, feature, self, painter, rect)
 
             def draw(self, posn, phelper, outerbounds=None):
-                if sizing == 'font':
+                if sizing in ('font', 'natural'):
                     return _draw_font_js_widget(
                         platform, feature, self, posn, phelper)
                 return super().draw(posn, phelper, outerbounds=outerbounds)
 
             def updateControlItem(self, control):
-                if sizing == 'font':
+                if sizing in ('font', 'natural'):
                     return _update_font_widget_control(self, control)
                 return super().updateControlItem(control)
 
@@ -2920,6 +3209,8 @@ def install_js_widget(platform, feature, declared):
     feature.widget_class = existing
     if feature not in platform._features:
         platform._features.append(feature)
+    if getattr(feature, 'formatting_pages', []):
+        _install_widget_formatting_pages()
     _install_widget_insert_actions()
     return feature
 
@@ -2993,6 +3284,7 @@ def install_js_feature(platform, entry, feature_dir, name):
     if target == 'widget':
         feature.source = declaration.get('source')
         feature.sizing = declaration.get('sizing', 'box')
+        feature.formatting_pages = declaration.get('formattingPages', [])
         return install_js_widget(platform, feature, declared)
 
     for member, _prop in declared:
@@ -3292,7 +3584,7 @@ def _run_python_feature(plugin, name):
 # --------------------------------------------------------------------------
 
 def install(verbose=True):
-    """Install the platform: the QuickJS host, the plumbing, self-publication.
+    """Install the selected JS backend, the plumbing, and self-publication.
 
     This installs no feature of its own: it makes the platform ready and then
     loads whatever features it finds beside it.  There is nothing to check
@@ -3322,6 +3614,9 @@ def install(verbose=True):
     else:
         platform = Platform(here, state=state)
         reused = False
+        app = qt.QCoreApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(platform.close_all)
 
     # publish first, so that if the plumbing below throws, a feature still
     # finds a host rather than nothing
@@ -3352,7 +3647,7 @@ def install(verbose=True):
         _say('veusz-js-engine %s: platform%s, %d feature(s)'
              % (__version__, ' (already up)' if reused else '', len(loaded)))
         _say('  engine  : %s'
-             % (platform.quickjs or '(MISSING -- the engine is not there)'))
+             % (platform.report()['engine'] or '(MISSING -- the engine is not there)'))
         _say('  features: %s'
              % (', '.join(feature_name(p) for p in loaded) or '(none)'))
         if failed:
@@ -3370,7 +3665,8 @@ def _write_log(here, platform, state):
     try:
         lines = ['veusz-js-engine %s installed at %s'
                  % (__version__, time.strftime('%Y-%m-%d %H:%M:%S')),
-                 'engine: %s' % (platform.quickjs or '(not found)')]
+                 'backend: %s' % platform.backend,
+                 'engine: %s' % (platform.report()['engine'] or '(not found)')]
         for path in state.features:
             lines.append('feature: %s  (%s)' % (feature_name(path), path))
         for name in sorted(platform.disabled_features or set()):

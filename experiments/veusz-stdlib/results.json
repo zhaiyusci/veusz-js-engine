@@ -1,0 +1,52 @@
+{
+  "executable": "C:\\Program Files\\Veusz\\veusz.exe",
+  "python": "3.13.12 (tags/v3.13.12:1cbe481, Feb  3 2026, 18:22:25) [MSC v.1944 64 bit (AMD64)]",
+  "frozen": true,
+  "modules": {
+    "http.server": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\http\\server.py"
+    },
+    "http.client": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\http\\client.py"
+    },
+    "socketserver": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\socketserver.py"
+    },
+    "socket": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\socket.py"
+    },
+    "threading": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\threading.py"
+    },
+    "queue": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\queue.py"
+    },
+    "json": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\json\\__init__.py"
+    },
+    "secrets": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\secrets.py"
+    },
+    "urllib.parse": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\urllib\\parse.py"
+    },
+    "webbrowser": {
+      "ok": true,
+      "file": "C:\\Program Files\\Veusz\\webbrowser.py"
+    }
+  },
+  "http_test": {
+    "status": 200,
+    "body": "veusz-http-ok",
+    "passed": true
+  }
+}

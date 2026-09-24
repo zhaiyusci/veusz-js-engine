@@ -59,6 +59,8 @@ A JavaScript feature chooses its integration with `veusz.feature(...)`:
   a movable, resizable, rotatable box, with native save/load and undo/redo.
   With **`sizing: 'font'`**, the widget instead has its own `size` in points and
   natural selection bounds, not user-adjustable width/height.
+  **`sizing: 'natural'`** uses point dimensions too, but adds no `size` setting:
+  the feature supplies its own physical-scale parameters.
 
 **[SMILES](smiles/README.md)** is a font-sized widget: choose
 **Insert -> SMILES molecule**, then enter a structure in its own SMILES property
@@ -66,6 +68,12 @@ and choose its own **Font size** (for example `12pt`). It no longer places switc
 in labels' Text/font settings. Disabling a widget feature removes its type and
 Insert action at the next startup, so enable it before loading documents that
 use it. See the [platform API](../README.md#standalone-widgets) for declarations.
+
+**[3D molecule](molecule3d/README.md)** is a separate MolecularRenaissance widget:
+choose a built-in model or paste XYZ coordinates, then set points per angstrom,
+view angles and shading. It is restricted to upstream **fast** rendering with
+parallel light and no cast shadows, including exports. It does not generate 3D
+coordinates from SMILES and does not change the 2D SMILES widget.
 
 ## A feature is a directory
 
