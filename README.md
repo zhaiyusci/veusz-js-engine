@@ -76,6 +76,8 @@ not add anything to ordinary Text/font settings.
 veusz-js-engine/               this repository: the platform
   veusz_js_engine.py           the one plugin Veusz is told about
   browser_backend.py           browser bridge; keep beside the plugin
+  browser_process_windows.py   atomic Job ownership (Windows 10+)
+  browser_process_posix.py     owner-pipe supervisor (Linux/macOS)
   browser_host/                required browser host assets
     index.html
     page.js
@@ -654,7 +656,7 @@ follow, and all of them matter:
   needs under Veusz, which passes empty globals — finds Veusz's *outer* loader
   instead, which names whatever Veusz was told to load, not the feature.
 
-Keep `browser_backend.py`, `browser_host/`, `jsapi.js` and `features/` with the
+Keep `browser_backend.py`, both `browser_process_*.py` drivers, `browser_host/`, `jsapi.js` and `features/` with the
 plugin as shown in the installation tree. Browser discovery prefers Firefox,
 then Edge, then Chrome; it searches installed locations and PATH unless an
 explicit executable is configured. No browser binary is bundled or required
@@ -722,10 +724,16 @@ extend this:
   `SharedWorker` and the public `importScripts` global, while a captured backend
   loader keeps script loading working. These restrictions are not a security
   sandbox: load trusted features only.
-* **Browser cleanup is best effort.** Windows can kill the process tree while the
-  main browser PID is alive; a parent crashing first can leave orphan processes.
-  Cleanup failures appear in the session report and retain the temporary directory
-  for diagnosis. Neither normal shutdown nor crashes guarantee absolute cleanup.
+* **Browser lifetime is tied to its host.** Windows 10+ uses an atomic creation-time
+  Job assignment with kill-on-close, including when Veusz is forcibly terminated.
+  Linux/macOS use a separate `/bin/sh` supervisor and an owner pipe: host exit/kill
+  delivers EOF and the supervisor kills its own process group. No extra Python
+  interpreter is needed. POSIX descendants that deliberately leave the group, or
+  a separately SIGKILLed supervisor, are outside this guarantee. Windows Job
+  startup failure is explicit, never an unowned-process fallback. Cleanup failures
+  retain ownership/profile for retry and diagnostics; abrupt host death can leave
+  profile files even when all browser processes exit. Windows process tests and
+  Linux supervisor tests pass; macOS remains untested. See [details](BROWSER-BACKEND.md).
 * **QuickJS fallback has no filesystem, network or `console` here.** The platform
   creates a bare runtime and injects only an `Object.hasOwn` polyfill, so a
   third-party JavaScript file cannot touch anything outside its own

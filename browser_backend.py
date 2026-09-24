@@ -7,6 +7,7 @@ Only trusted local JavaScript is supported (this is not a security sandbox).
 uses classic importScripts, preserving script global lexical declarations.
 """
 import atexit
+import importlib.util
 import json
 import math
 import os
@@ -14,8 +15,7 @@ from pathlib import Path
 import queue
 import secrets
 import shutil
-import signal
-import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,6 +24,30 @@ from urllib.parse import parse_qs, urlsplit
 
 
 _ASSETS = Path(__file__).resolve().parent / 'browser_host'
+_DRIVER_LOCK = threading.Lock()
+
+
+def _launch_owned_process(args, log_file):
+    """Load a sibling driver without requiring the plugin directory on sys.path."""
+    platform = 'windows' if os.name == 'nt' else 'posix' if os.name == 'posix' else None
+    if platform is None:
+        raise RuntimeError('Unsupported browser process platform: ' + os.name)
+    path = Path(__file__).resolve().with_name('browser_process_' + platform + '.py')
+    name = '_veusz_browser_process_' + platform
+    with _DRIVER_LOCK:
+        module = sys.modules.get(name)
+        if module is None or getattr(module, '__file__', None) != str(path):
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(name, None)
+                raise
+    return module.launch(args, log_file)
+
+
 _CSP = ("default-src 'none'; script-src 'self' blob: 'unsafe-eval'; "
         "worker-src 'self' blob:; connect-src 'self'; "
         "base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
@@ -68,6 +92,7 @@ class BrowserSession:
         self._token = secrets.token_urlsafe(32)
         self._server = None
         self._process = None
+        self._process_report = None
         self._temp = None
         self._log = None
         self._temp_path = None
@@ -150,12 +175,16 @@ class BrowserSession:
                         if self.mode == 'headless':
                             args.append('--headless=new')
                         args.append(url)
-                    options = {'stdout': self._log, 'stderr': self._log, 'stdin': subprocess.DEVNULL}
-                    if os.name == 'nt':
-                        options['creationflags'] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-                    else:
-                        options['start_new_session'] = True
-                    self._process = subprocess.Popen(args, **options)
+                    try:
+                        self._process = _launch_owned_process(args, self._log)
+                    except BaseException as exc:
+                        # A failed launch can still own live resources when its
+                        # rollback timed out. Adopt them before outer cleanup;
+                        # never treat an unconfirmed rollback as 'no process'.
+                        self._process = getattr(exc, 'process_owner', None)
+                        if self._process is not None:
+                            self._pid = self._process.pid
+                        raise
                     self._pid = self._process.pid
                 threading.Thread(target=self._monitor, daemon=True, name='veusz-js-monitor').start()
                 deadline = time.monotonic() + 60
@@ -359,26 +388,27 @@ class BrowserSession:
                     target.put_nowait({'error': self._failure or 'Browser session is closed'})
         with self._cleanup_lock:
             proc = self._process
+            process_stopped = True
             if proc is not None:
                 try:
-                    if os.name == 'nt':
-                        # Never kill by executable name, nor by a PID already reaped.
-                        if proc.poll() is None:
-                            subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
-                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL, timeout=3,
-                                           creationflags=subprocess.CREATE_NO_WINDOW, check=False)
-                    else:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    if proc.poll() is None:
-                        proc.kill()
-                    self._returncode = proc.wait(timeout=2)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    self._cleanup_errors.append('process: ' + str(exc))
-                self._process = None
+                    # Ownership remains valid even if the browser root exited:
+                    # Windows Job membership / POSIX live supervisor, not PID lookup.
+                    proc.terminate_tree()
+                    # Startup rollback can transfer an empty Job whose handle
+                    # failed to close before any child was created.
+                    if proc.pid is not None:
+                        self._returncode = proc.wait(timeout=2)
+                    proc.close_handles()
+                    self._process = None
+                except Exception as exc:
+                    process_stopped = False
+                    self._cleanup_errors.append(('process: ' + str(exc)).replace(self._token, '<redacted>'))
+                    # Keep the owner and profile for a later close() retry.
+                finally:
+                    try:
+                        self._process_report = self._safe_process_report(proc)
+                    except Exception as exc:
+                        self._cleanup_errors.append(('process report: ' + str(exc)).replace(self._token, '<redacted>'))
             if self._server is not None:
                 self._server.shutdown()
                 self._server.server_close()
@@ -386,13 +416,18 @@ class BrowserSession:
             if self._log is not None:
                 self._log.close()
                 self._log = None
-            if self._temp is not None:
+            if self._temp is not None and process_stopped:
                 try:
                     shutil.rmtree(self._temp)
+                    self._temp = None
                 except OSError as exc:
                     self._cleanup_errors.append('temporary directory retained at %s: %s' % (self._temp_path, exc))
-                self._temp = None
-            atexit.unregister(self.close)
+            if self._process is None and self._temp is None:
+                atexit.unregister(self.close)
+
+    def _safe_process_report(self, proc):
+        # TimeoutExpired can include full argv (and the bootstrap token).
+        return json.loads(json.dumps(proc.report()).replace(self._token, '<redacted>'))
 
     def report(self):
         """Return status suitable for json.dumps; never expose session credentials."""
@@ -400,6 +435,8 @@ class BrowserSession:
             return {'backend': 'browser-http', 'state': self._state, 'error': self._failure,
                     'browser': self.executable, 'mode': self.mode, 'timeout': self.timeout,
                     'pid': self._pid, 'returncode': self._returncode, 'url': self._url,
+                    'process_lifetime': (self._safe_process_report(self._process) if self._process is not None
+                                         else self._process_report),
                     'connected': self._client is not None and not self._stop.is_set(),
                     'runtimes': [{'id': r.ident, 'label': r.label, 'closed': r._closed or self._stop.is_set()}
                                  for r in self._runtimes.values()],

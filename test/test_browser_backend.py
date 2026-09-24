@@ -371,6 +371,110 @@ class BackendSelectionTests(unittest.TestCase):
         self.assertFalse(runtime.started)
 
 
+class BrowserProcessCleanupTests(unittest.TestCase):
+    def test_empty_job_rollback_owner_does_not_wait_for_nonexistent_process(self):
+        from browser_backend import BrowserSession
+        session = BrowserSession()
+        self.addCleanup(session.close)
+        owner = mock.Mock(pid=None)
+        owner.report.return_value = {'mechanism': 'test-owner', 'tree_exited': True}
+        session._process = owner
+        session.close()
+        owner.terminate_tree.assert_called_once()
+        owner.wait.assert_not_called()
+        owner.close_handles.assert_called_once()
+        self.assertIsNone(session._process)
+        self.assertEqual(session.report()['cleanup_errors'], [])
+
+    def test_driver_closes_tree_even_when_root_has_exited(self):
+        from browser_backend import BrowserSession
+        session = BrowserSession()
+        self.addCleanup(session.close)
+        process = mock.Mock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        process.report.return_value = {'mechanism': 'test-owner', 'tree_exited': True}
+        session._process = process
+        session.close()
+        process.terminate_tree.assert_called_once()
+        process.close_handles.assert_called_once()
+        self.assertIsNone(session._process)
+        self.assertEqual(session.report()['process_lifetime']['mechanism'], 'test-owner')
+
+    def test_failed_cleanup_retains_owner_profile_and_can_retry(self):
+        from browser_backend import BrowserSession
+        session = BrowserSession()
+        self.addCleanup(session.close)
+        process = mock.Mock()
+        process.terminate_tree.side_effect = [TimeoutError('tree alive'), None]
+        process.wait.return_value = 1
+        process.report.return_value = {'mechanism': 'test-owner'}
+        session._process = process
+        session._temp = session._temp_path = 'mock-owned-profile'
+        with mock.patch('browser_backend.shutil.rmtree') as remove:
+            session.close()
+            self.assertIs(session._process, process)
+            self.assertEqual(session._temp, 'mock-owned-profile')
+            remove.assert_not_called()
+            process.close_handles.assert_not_called()
+            session.close()
+            remove.assert_called_once_with('mock-owned-profile')
+        self.assertIsNone(session._process)
+        self.assertIsNone(session._temp)
+        self.assertIn('tree alive', session.report()['cleanup_errors'][0])
+
+    def test_launch_rollback_failure_adopts_owner_before_session_cleanup(self):
+        import browser_backend
+        session = browser_backend.BrowserSession()
+        self.addCleanup(session.close)
+        owner = mock.Mock(pid=123)
+        owner.terminate_tree.side_effect = TimeoutError('still alive')
+        owner.wait.return_value = 1
+        owner.report.return_value = {'mechanism': 'test-owner'}
+        failure = RuntimeError('launch rollback failed')
+        failure.process_owner = owner
+        server = mock.Mock(server_port=12345)
+        with mock.patch.object(session, '_detect_browser', return_value='mock-browser'), \
+                mock.patch.object(session, '_make_server', return_value=server), \
+                mock.patch.object(browser_backend, '_launch_owned_process', side_effect=failure), \
+                mock.patch.object(browser_backend.tempfile, 'mkdtemp', return_value='mock-profile'), \
+                mock.patch.object(Path, 'mkdir'), mock.patch.object(Path, 'open'), \
+                mock.patch.object(browser_backend.shutil, 'rmtree') as remove:
+            with self.assertRaisesRegex(RuntimeError, 'launch rollback failed'):
+                session._start()
+            self.assertIs(session._process, owner)
+            self.assertEqual(session._pid, 123)
+            self.assertEqual(session._temp, 'mock-profile')
+            remove.assert_not_called()
+            owner.terminate_tree.side_effect = None
+            session.close()
+            remove.assert_called_once_with('mock-profile')
+
+    def test_cleanup_diagnostics_redact_bootstrap_token(self):
+        from browser_backend import BrowserSession
+        session = BrowserSession()
+        self.addCleanup(session.close)
+        owner = mock.Mock()
+        owner.terminate_tree.side_effect = [TimeoutError('argv token=' + session._token), None]
+        owner.wait.return_value = 1
+        owner.report.return_value = {'cleanup_errors': ['argv token=' + session._token]}
+        session._process = owner
+        session.close()
+        self.assertNotIn(session._token, json.dumps(session.report()))
+        session.close()
+        self.assertNotIn(session._token, json.dumps(session.report()))
+
+    def test_driver_load_failure_is_not_an_unowned_popen_fallback(self):
+        import browser_backend
+        with mock.patch.object(browser_backend.importlib.util, 'spec_from_file_location',
+                               side_effect=OSError('missing lifetime driver')), \
+                mock.patch.dict(sys.modules):
+            sys.modules.pop('_veusz_browser_process_windows', None)
+            sys.modules.pop('_veusz_browser_process_posix', None)
+            with self.assertRaisesRegex(OSError, 'missing lifetime driver'):
+                browser_backend._launch_owned_process(['never-execute'], None)
+
+
 class BrowserHTTPTests(unittest.TestCase):
     """Exercise the production loopback HTTP handler without launching a browser."""
 
@@ -385,7 +489,7 @@ class BrowserHTTPTests(unittest.TestCase):
         for name in ('VEUSZ_JS_ENGINE_BROWSER', 'VEUSZ_JS_ENGINE_BROWSER_MODE',
                      'VEUSZ_JS_ENGINE_BROWSER_TIMEOUT'):
             os.environ.pop(name, None)
-        launcher = mock.patch.object(self.backend.subprocess, 'Popen',
+        launcher = mock.patch.object(self.backend, '_launch_owned_process',
                                     side_effect=AssertionError('must not launch browser'))
         self.launcher = launcher.start()
         self.addCleanup(launcher.stop)

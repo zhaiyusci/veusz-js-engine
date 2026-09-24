@@ -12,6 +12,8 @@
 veusz-js-engine/
   veusz_js_engine.py       Veusz 注册的唯一插件
   browser_backend.py      Veusz 内置 Python 加载的浏览器桥接
+  browser_process_windows.py  Windows 10+ 原子 Job 进程管理
+  browser_process_posix.py    Linux/macOS 管道监护进程
   browser_host/
     index.html
     page.js
@@ -100,7 +102,44 @@ Worker 禁用这些面向 feature 的全局 API：`fetch`、`XMLHttpRequest`（X
 
 `Platform.close_all()` 是永久 dispose，不是“释放后下次调用自动重建”的按钮。关闭后的平台不能继续使用；热重载不受支持。
 
-Windows 正常关闭时，在浏览器主 PID 尚存活的情况下可用 `taskkill` 结束其进程树；若父进程先崩溃，可能留下孤儿进程。清理是 best effort，不能承诺在崩溃、权限问题或进程退出竞态下绝对清理干净。清理失败会记录在 session `report()` 中，并保留临时目录（包括 profile/日志）供排查，而不是宣称已全部删除。排查时只识别本次专用进程/profile，不要结束或删除用户自己的浏览器会话。
+### Windows 10+：由操作系统绑定生命周期
+
+浏览器在 `CreateProcessW` 创建时，通过 `PROC_THREAD_ATTRIBUTE_JOB_LIST` **原子加入 Job**，随后从挂起状态恢复；不再存在“进程已创建、尚未加入 Job”的未受控窗口。Job 设置 `KILL_ON_JOB_CLOSE`，句柄只由 Veusz 持有、不可继承；浏览器仅继承明确列出的日志/空输入句柄。
+
+因此 Veusz 正常退出、崩溃或被单独强杀时，系统关闭它的 Job 句柄并终止 Job 成员，包括浏览器派生进程。正常关闭会主动终止 Job，并等待整组 ActiveProcesses 归零，不只等根 PID。根浏览器先退出也不会丢失子进程的所有权。若系统不支持原子 Job 属性、已有受限 Job 策略不兼容，启动明确报错，**不会偷偷退回无生命周期保护的 Popen**。
+
+### Linux/macOS：独立进程组与管道监护
+
+使用系统 `/bin/sh` 启动一个独立 session/进程组中的监护进程，浏览器在该组内运行。Veusz 持有唯一 owner 管道写端；正常关闭或宿主 `SIGKILL` 都会产生 EOF，监护进程据此对自身进程组发送 SIGKILL。监护进程先于浏览器存在，浏览器 stdin 指向 `/dev/null`，不会吞掉监护管道。无需额外 Python 可执行文件，也不在多线程 Python 中 fork 后执行 Python 代码。
+
+这不是 Windows Job 的同等级硬约束：主动 `setsid`/`setpgid` 逃离进程组的后代不在保护范围；若单独对监护进程发送 SIGKILL，也不能依靠它执行清理。正常浏览器根进程提前退出时，现有 HTTP 心跳/启动超时负责发现故障。报告中的 POSIX `pid` 是监护进程 PID，`process_lifetime.pid_role` 会明确注明。
+
+### 清理失败与磁盘残留
+
+两种实现都只管理本次专用进程，不按浏览器名称杀进程，也不依赖可能复用的旧 PID 追杀子树。启动回滚若无法确认清理成功，会把 owner 交回 session 保留/重试；正常清理失败也保留 owner 和临时目录。`report().process_lifetime` 记录机制及清理状态，诊断中的会话令牌会被遮蔽。
+
+**进程自动退出不等于临时文件自动删除。** Veusz 被强杀时 Python 的目录删除代码无法运行，临时 profile/日志可能留在磁盘上；正常退出才会尝试删除。不要自动删除其他正在运行的 Veusz 会话或用户自己的浏览器配置。权限问题、系统故障和上述 POSIX 边界不在无条件保证范围内。
+
+### 本轮生命周期实测
+
+- Windows：13 项 Job 测试全部通过，含宿主强杀、创建完成但浏览器尚未恢复运行时强杀、根进程先退出、故障回滚与重试。
+- Linux：在现有 openSUSE Tumbleweed / WSL、Python 3.13.13 上执行 20 项测试，全部通过；包含真实父子进程树、宿主 SIGKILL，以及启动窗口中的宿主死亡。这里未安装 Linux 浏览器，**并非 Linux 浏览器/Veusz 图形环境端到端验收**。
+- 安装版 Windows Veusz：分别启动真实 Firefox/Edge，执行 MathJax JS 后，仅对 Veusz 本身调用 `Kill()`（没有 `/T`，没有直接杀浏览器）。捕获的 Firefox 8 个进程、Edge 15 个进程均自动退出；本次观察耗时约 84 ms / 97 ms，非性能保证。判定通过后才删除专用临时目录，补救清理不计入通过条件。
+- 两种浏览器各 43 项后端测试通过；安装版正常文档导出也通过。
+- Linux 后端整合/HTTP 测试：32 项通过，11 项跳过（10 项真实浏览器测试及 1 项 Windows 专属发现测试），无失败。
+- macOS 共用 POSIX 实现，但**尚未进行 macOS 实机验证**。
+
+复现强杀验收（只启动/结束独立测试实例）：
+
+```powershell
+python -S -B -m unittest discover -s test -p test_browser_process_windows.py -v
+.\test\run_browser_owner_death.ps1
+.\test\run_browser_owner_death.ps1 -Browser 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+```
+
+Linux/macOS 机制测试：`python3 -B -S -m unittest discover -s test -p test_browser_process_posix.py -v`。
+强杀验收报告在 `build-test-browser-owner-death/Firefox/` 和 `build-test-browser-owner-death/msedge/`。
+不要把 `test/browser_owner_death_plugin.py` 加入长期插件偏好设置。
 
 建议故障排查顺序：确认全部配套文件存在 → 确认 exe 路径及环境变量 → 重启后用 `visible` 检查启动 → 查看 session report/保留的日志 → 必要时显式切换 QuickJS 并再次重启。
 
@@ -108,7 +147,7 @@ Windows 正常关闭时，在浏览器主 PID 尚存活的情况下可用 `taskk
 
 已在 Windows 的 Firefox 156.0.1、Edge 153，以及安装版 Veusz 4.2.1（内置 Python 3.13.12）上验证。
 
-- Firefox、Edge 的后端测试各 37 项通过（其中 10 项为真实浏览器测试），覆盖隔离、HTTP 访问控制、异常传递、超时失效、关闭竞争、自动发现、经典脚本全局变量和离线 API。
+- Firefox、Edge 的后端测试各 43 项通过（其中 10 项为真实浏览器测试），覆盖隔离、HTTP 访问控制、异常传递、超时失效、关闭竞争、自动发现、经典脚本全局变量和离线 API。
 - 延迟加载 7 项、功能管理器 9 项通过。
 - 平台 48 项、MathJax 双层接口 11 项、MathJax Qt 文字排版 12 项、KaTeX 10 项、SMILES 17 项、3D 分子 19 项、3D 原生面板 11 项通过。
 - 安装版 Veusz 中，MathJax 外部 Asana 字体、Qt 文字轮廓、KaTeX 原生 MathML、2D 分子和带标签的 3D 分子共同完成真实文档导出。
@@ -133,7 +172,7 @@ python -S -m unittest discover -s test -p test_browser_backend.py -v
 
 ### 本机已有同名 widget 的注意事项
 
-本机安装版 Veusz 在加载当前插件前已经注册了一个无本平台标记的 `molecule3d` widget。正式插件会记录 `widget type 'molecule3d' is already registered`，并拒绝覆盖它；这不是浏览器运算失败。
+前一轮验收曾遇到：安装版 Veusz 在加载当前插件前已经注册了一个无本平台标记的 `molecule3d` widget。正式插件会记录 `widget type 'molecule3d' is already registered`，并拒绝覆盖它；这不是浏览器运算失败。
 
 为独立验收本项目的 3D feature，安装版测试程序仅在其一次性进程内移除冲突注册，并临时启用测试所需 feature；不修改保存的插件/功能偏好设置。生产使用时应检查并避免同时加载两个注册同名 widget 的插件或定制组件；未处理冲突前，不能把测试中的四-feature成功当成当前普通启动已经启用四个 feature 的保证。
 
